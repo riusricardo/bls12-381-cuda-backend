@@ -1,8 +1,26 @@
-// SPDX-License-Identifier: MIT
-// Copyright (c) 2023 Ingonyama
-//
-// This file is part of the ICICLE library (https://github.com/ingonyama-zk/icicle)
-// Copied from: icicle/include/icicle/memory_tracker.h
+/*
+ * Copyright (C) 2023 Ingonyama (original MIT-licensed ICICLE code)
+ * Copyright (C) 2026 BLS12-381 CUDA Backend Contributors (modifications and integration)
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This file is part of BLS12-381 CUDA Backend.
+ * Originally from ICICLE library (https://github.com/ingonyama-zk/icicle)
+ * Copied from: icicle/include/icicle/memory_tracker.h
+ *
+ * BLS12-381 CUDA Backend is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * BLS12-381 CUDA Backend is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with BLS12-381 CUDA Backend.  If not, see <https://www.gnu.org/licenses/>.
+ */
 
 #pragma once
 

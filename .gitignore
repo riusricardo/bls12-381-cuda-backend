@@ -1,6 +1,10 @@
 # Build directory
 build/
 
+# CUDA profiling directory
+profiles/
+
+
 # CMake generated files
 CMakeCache.txt
 CMakeFiles/
