@@ -89,6 +89,7 @@
 
 #include "point.cuh"
 #include "icicle_types.cuh"
+#include "gpu_config.cuh"
 #include <cuda_runtime.h>
 #include <cub/cub.cuh>
 
@@ -96,6 +97,7 @@ namespace msm {
 
 using namespace bls12_381;
 using namespace icicle;
+using namespace gpu;
 
 // =============================================================================
 // MSM Limits and Constants
@@ -111,114 +113,6 @@ constexpr int MAX_WINDOW_SIZE = 24;  // Prevents bucket count overflow
 
 // Invalid bucket index marker (for zero contributions)
 constexpr unsigned int INVALID_BUCKET_INDEX = 0xFFFFFFFF;
-
-// =============================================================================
-// GPU Performance Tuning
-// =============================================================================
-
-// Kernel type identifiers (compile-time constants to avoid string comparison)
-enum class KernelType {
-    COMPUTE_INDICES,
-    HISTOGRAM,
-    ACCUMULATE,
-    REDUCTION
-};
-
-/**
- * @brief Get optimal block size based on GPU compute capability and kernel type
- * 
- * Different kernels have different characteristics:
- * - Memory-bound: benefit from larger blocks (better memory bandwidth utilization)
- * - Compute-bound: may need smaller blocks (register pressure)
- * - Atomic-bound: medium blocks (balance contention vs parallelism)
- */
-inline int get_optimal_block_size(int compute_capability_major, KernelType kernel_type) {
-    // Validate compute capability is in reasonable range
-    // GPU compute capabilities range from 1.x to 10.x (as of 2025)
-    if (compute_capability_major < 1 || compute_capability_major > 15) {
-        // Invalid capability - return safe conservative default
-        return 256;
-    }
-    
-    // Modern GPUs (Ampere 8.x, Ada 8.9, Hopper 9.x, Blackwell 10.x+)
-    bool is_modern = compute_capability_major >= 8;
-    
-    // Kernel-specific tuning
-    switch (kernel_type) {
-        case KernelType::COMPUTE_INDICES:
-            // Memory-bound: reading scalars, writing indices
-            // Higher thread count improves memory throughput
-            return is_modern ? 512 : 256;
-            
-        case KernelType::HISTOGRAM:
-            // Atomic-bound: too many threads increase contention
-            // Medium block size balances parallelism and atomic efficiency
-            return is_modern ? 512 : 256;
-            
-        case KernelType::ACCUMULATE:
-            // Compute-bound: point arithmetic (field ops, curve ops)
-            // Register pressure from point operations limits thread count
-            return 256;  // Conservative for all architectures
-            
-        case KernelType::REDUCTION:
-            // Sequential per-thread: no benefit from larger blocks
-            return 256;
-            
-        default:
-            // Unknown kernel type - return safe default
-            return 256;
-    }
-}
-
-/**
- * @brief Detect GPU compute capability with error checking (thread-safe cached)
- * 
- * SECURITY:
- * - Thread-safe: uses atomic operations for cache initialization
- * - Error handling: validates all CUDA calls, returns safe default on failure
- * - Bounds checking: ensures returned value is in valid range
- * 
- * @return GPU compute capability major version, or 5 (safe default) on error
- */
-inline int get_gpu_compute_capability() {
-    // Thread-safe cache using atomic flag
-    static std::atomic<int> cached_capability{-1};
-    
-    // Fast path: capability already cached
-    int capability = cached_capability.load(std::memory_order_acquire);
-    if (capability != -1) {
-        return capability;
-    }
-    
-    // Slow path: query GPU capability with error checking
-    int device = 0;
-    cudaError_t err = cudaGetDevice(&device);
-    if (err != cudaSuccess) {
-        // CUDA not initialized or no GPU - return safe default
-        // Default to compute capability 5.x (Maxwell) - conservative but functional
-        cached_capability.store(5, std::memory_order_release);
-        return 5;
-    }
-    
-    cudaDeviceProp prop;
-    err = cudaGetDeviceProperties(&prop, device);
-    if (err != cudaSuccess) {
-        // Failed to get device properties - return safe default
-        cached_capability.store(5, std::memory_order_release);
-        return 5;
-    }
-    
-    // Validate compute capability is in reasonable range
-    int major = prop.major;
-    if (major < 1 || major > 15) {
-        // Invalid capability - clamp to safe range
-        major = 5;
-    }
-    
-    // Cache the validated capability
-    cached_capability.store(major, std::memory_order_release);
-    return major;
-}
 
 // =============================================================================
 // Generic Point Operation Dispatchers
@@ -428,6 +322,177 @@ __global__ void compute_bucket_indices_kernel(
 }
 
 /**
+ * @brief Warp-cooperative bucket accumulation for large buckets
+ * 
+ * When a small number of buckets have many points,
+ * we use multiple threads to process each bucket in parallel.
+ * This spreads work across more threads and SMs.
+ * 
+ * Strategy: Each thread block processes BUCKETS_PER_BLOCK buckets.
+ * Within a block, we use NUM_THREADS_PER_BUCKET threads per bucket.
+ * Each thread accumulates a strided portion, then we reduce within the group.
+ * 
+ * Template parameters:
+ * - A: Affine point type (G1Affine or G2Affine)
+ * - P: Projective point type (G1Projective or G2Projective)
+ * - THREADS_PER_BUCKET: Number of threads cooperating per bucket (power of 2, ≤ 32)
+ */
+template<typename A, typename P, int THREADS_PER_BUCKET = 8>
+__global__ void accumulate_cooperative_kernel(
+    P* buckets,
+    const unsigned int* sorted_packed_indices,
+    const A* bases,
+    const unsigned int* bucket_offsets,
+    const unsigned int* bucket_sizes,
+    int total_buckets
+) {
+    static_assert(THREADS_PER_BUCKET <= 32 && (THREADS_PER_BUCKET & (THREADS_PER_BUCKET - 1)) == 0,
+                  "THREADS_PER_BUCKET must be power of 2 and <= 32");
+    
+    // Each group of THREADS_PER_BUCKET threads processes one bucket
+    int groups_per_block = blockDim.x / THREADS_PER_BUCKET;
+    int group_id = threadIdx.x / THREADS_PER_BUCKET;
+    int lane_in_group = threadIdx.x % THREADS_PER_BUCKET;
+    
+    // Global bucket ID
+    int bucket_id = blockIdx.x * groups_per_block + group_id;
+    
+    if (bucket_id >= total_buckets) return;
+    
+    unsigned int offset = bucket_offsets[bucket_id];
+    unsigned int size = bucket_sizes[bucket_id];
+    
+    // Each lane accumulates a strided portion
+    P local_acc = P::identity();
+    
+    for (unsigned int i = lane_in_group; i < size; i += THREADS_PER_BUCKET) {
+        unsigned int idx = offset + i;
+        unsigned int packed = sorted_packed_indices[idx];
+        unsigned int point_idx = packed >> 1;
+        unsigned int sign = packed & 1;
+        
+        A base = bases[point_idx];
+        if (sign) {
+            base = base.neg();
+        }
+        
+        point_add_mixed(local_acc, local_acc, base);
+    }
+    
+    // Tree-based reduction within the group using shared memory
+    extern __shared__ char shared_mem[];
+    P* shared_acc = reinterpret_cast<P*>(shared_mem);
+    
+    // Store local accumulator
+    shared_acc[threadIdx.x] = local_acc;
+    __syncthreads();
+    
+    // Reduce within the group
+    for (int stride = THREADS_PER_BUCKET / 2; stride > 0; stride >>= 1) {
+        if (lane_in_group < stride) {
+            P other = shared_acc[threadIdx.x + stride];
+            point_add(shared_acc[threadIdx.x], shared_acc[threadIdx.x], other);
+        }
+        __syncthreads();
+    }
+    
+    // Lane 0 writes the result
+    if (lane_in_group == 0) {
+        buckets[bucket_id] = shared_acc[threadIdx.x];
+    }
+}
+
+/**
+ * @brief Persistent-thread bucket indices kernel
+ * 
+ * For small MSM sizes, we use persistent threads
+ * to ensure all SMs are occupied. Each thread processes multiple scalars
+ * in a strided fashion.
+ * 
+ * This increases parallelism for small MSM sizes where the standard
+ * 1-thread-per-scalar approach leaves the GPU underutilized.
+ * 
+ * NOTE: This kernel uses the same signed-digit representation with carry
+ * propagation as the original kernel.
+ */
+template<typename S>
+__global__ void compute_bucket_indices_persistent_kernel(
+    unsigned int* bucket_indices,
+    unsigned int* packed_indices,
+    const S* scalars,
+    int msm_size,
+    int c,
+    int num_windows,
+    int num_buckets,
+    int total_work_items  // msm_size, but each thread processes multiple
+) {
+    const int buckets_per_window = num_buckets + 1;
+    
+    // Persistent thread pattern: each thread processes strided work items
+    int stride = gridDim.x * blockDim.x;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    // Process multiple scalars per thread
+    for (int idx = tid; idx < msm_size; idx += stride) {
+        S scalar = scalars[idx];
+        int carry = 0;
+        
+        // Process all windows for this scalar (must be sequential due to carry)
+        for (int w = 0; w < num_windows; w++) {
+            int output_idx = idx * num_windows + w;
+            
+            // Extract window value using same logic as original kernel
+            int start_bit = w * c;
+            int limb_idx = start_bit / 64;
+            int bit_in_limb = start_bit % 64;
+            
+            uint64_t window = scalar.limbs[limb_idx] >> bit_in_limb;
+            if (bit_in_limb + c > 64 && limb_idx + 1 < S::LIMBS) {
+                window |= (scalar.limbs[limb_idx + 1] << (64 - bit_in_limb));
+            }
+            window &= ((1ULL << c) - 1);
+            
+            // Add carry from previous window
+            int window_val = (int)window + carry;
+            carry = 0;
+            
+            // Constant-time logic
+            int sign = 0;
+            int bucket_val = window_val;
+            
+            // Handle signed digit: if (window_val > num_buckets)
+            int is_large = (window_val > num_buckets);
+            if (is_large) {
+                bucket_val = (1 << c) - window_val;
+                sign = 1;
+                carry = 1;
+            }
+            
+            // Handle zero
+            int is_zero = (bucket_val == 0);
+            if (is_zero) {
+                bucket_val = num_buckets + 1; // Map to trash bucket
+                sign = 0;
+            }
+            
+            // Global bucket index (0-based)
+            unsigned int bucket_idx = w * buckets_per_window + (bucket_val - 1);
+            
+            bucket_indices[output_idx] = bucket_idx;
+            packed_indices[output_idx] = (static_cast<unsigned int>(idx) << 1) | (sign & 1);
+        }
+        
+        // Handle carry overflow (same as original)
+        if (carry != 0) {
+            for (int w = 0; w < num_windows; w++) {
+                int output_idx = idx * num_windows + w;
+                bucket_indices[output_idx] = INVALID_BUCKET_INDEX;
+            }
+        }
+    }
+}
+
+/**
  * @brief Conflict-free bucket accumulation after sorting (templated for G1/G2)
  * 
  * Template parameters:
@@ -497,7 +562,7 @@ __global__ void histogram_atomic_kernel(
 /**
  * @brief Optimized histogram kernel with warp-level aggregation
  * 
- * OPTIMIZATION: Reduces atomic contention by aggregating within warps first.
+ * Reduces atomic contention by aggregating within warps first.
  * Uses warp-level ballot and popcount to count matching buckets before
  * issuing a single atomic per warp instead of per thread.
  */
@@ -583,9 +648,141 @@ __global__ void parallel_bucket_reduction_kernel(
     window_results[window_idx] = window_sum;
 }
 
+/**
+ * @brief Multi-block parallel bucket reduction
+ * 
+ * Each block processes one window, with multiple threads
+ * cooperating to compute the triangle summation in parallel.
+ * 
+ * The triangle sum Σ i*B[i] for i=1..n can be rewritten as:
+ *   Σ i*B[i] = Σ_{i=1}^{n} (Σ_{j=i}^{n} B[j])
+ * 
+ * We compute this in two phases:
+ * 1. Parallel suffix sums: Each thread computes suffix sum for its stripe
+ * 2. Cooperative reduction: Combine stripe results
+ */
+template<typename P>
+__global__ void parallel_bucket_reduction_multithread_kernel(
+    P* window_results,
+    const P* buckets,
+    int num_windows,
+    int num_buckets,
+    int buckets_per_window
+) {
+    // Each block handles one window
+    int window_idx = blockIdx.x;
+    if (window_idx >= num_windows) return;
+    
+    const int THREADS_PER_WINDOW = blockDim.x;
+    int tid = threadIdx.x;
+    
+    const P* window_buckets = buckets + window_idx * buckets_per_window;
+    
+    // Each thread processes a stripe of buckets
+    int buckets_per_thread = (num_buckets + THREADS_PER_WINDOW - 1) / THREADS_PER_WINDOW;
+    int start_bucket = tid * buckets_per_thread;
+    int end_bucket = min(start_bucket + buckets_per_thread, num_buckets);
+    
+    // Phase 1: Each thread computes partial triangle sum for its stripe
+    // For buckets [start, end), we need:
+    //   running_sum = sum of buckets from end to num_buckets (computed later)
+    //   partial_window_sum = sum of running_sums for this stripe
+    
+    // First, compute local running sum and window sum for the stripe
+    P local_running = P::identity();
+    P local_window = P::identity();
+    
+    // Process stripe from right to left (high bucket index to low)
+    for (int i = end_bucket - 1; i >= start_bucket; i--) {
+        point_add(local_running, local_running, window_buckets[i]);
+        point_add(local_window, local_window, local_running);
+    }
+    
+    // Store partial results in shared memory
+    extern __shared__ char shared_mem[];
+    P* shared_running = reinterpret_cast<P*>(shared_mem);
+    P* shared_window = shared_running + THREADS_PER_WINDOW;
+    
+    shared_running[tid] = local_running;
+    shared_window[tid] = local_window;
+    __syncthreads();
+    
+    // Phase 2: Thread 0 combines results from all threads
+    // Each stripe's running_sum needs to be added to all stripes to its left
+    if (tid == 0) {
+        P total_window = P::identity();
+        P suffix_sum = P::identity();
+        
+        // Process from rightmost thread to leftmost
+        for (int t = THREADS_PER_WINDOW - 1; t >= 0; t--) {
+            int t_start = t * buckets_per_thread;
+            int t_buckets = min(buckets_per_thread, num_buckets - t_start);
+            if (t_buckets <= 0) continue;
+            
+            // This thread's window sum needs suffix_sum added t_buckets times
+            P adjusted_window = shared_window[t];
+            for (int k = 0; k < t_buckets; k++) {
+                point_add(adjusted_window, adjusted_window, suffix_sum);
+            }
+            point_add(total_window, total_window, adjusted_window);
+            
+            // Update suffix sum
+            point_add(suffix_sum, suffix_sum, shared_running[t]);
+        }
+        
+        window_results[window_idx] = total_window;
+    }
+}
+
 // =============================================================================
 // Final Window Combination
 // =============================================================================
+
+/**
+ * @brief Parallel final accumulation - processes windows in parallel stages
+ * 
+ * Instead of single-threaded sequential processing,
+ * we parallelize the doubling operations across threads.
+ * 
+ * Algorithm:
+ * 1. Each window result needs to be multiplied by 2^(w*c)
+ * 2. We pre-compute the shifted window results in parallel
+ * 3. Then reduce them using a tree-based approach
+ * 
+ * Template parameters:
+ * - P: Projective point type (G1Projective or G2Projective)
+ */
+template<typename P>
+__global__ void final_accumulation_parallel_kernel(
+    P* result,
+    P* window_results,  // Modified in-place for shifted values
+    int num_windows,
+    int c
+) {
+    // Stage 1: Each thread doubles its window result w*c times in parallel
+    // Thread w handles window w, doubling c*w times
+    int w = threadIdx.x;
+    
+    if (w < num_windows && w > 0) {
+        P val = window_results[w];
+        int doublings = w * c;
+        for (int i = 0; i < doublings; i++) {
+            point_double(val, val);
+        }
+        window_results[w] = val;
+    }
+    __syncthreads();
+    
+    // Stage 2: Tree-based reduction to sum all shifted windows
+    // Only thread 0 does the reduction (windows are small, typically < 32)
+    if (threadIdx.x == 0) {
+        P acc = window_results[0];
+        for (int i = 1; i < num_windows; i++) {
+            point_add(acc, acc, window_results[i]);
+        }
+        *result = acc;
+    }
+}
 
 /**
  * @brief Combine window results: result = sum_{w} 2^{w*c} * window_result[w]
@@ -770,13 +967,23 @@ cudaError_t msm_cuda(
     MSM_CUDA_CHECK(cudaMalloc(&d_bucket_sizes, total_buckets * sizeof(unsigned int)));
     
     // 1. Compute Indices
+    // Use persistent-thread kernel for small MSM sizes
+    // to ensure all SMs are occupied even with few scalars
     {
-        int gpu_capability = get_gpu_compute_capability();
-        int threads = get_optimal_block_size(gpu_capability, KernelType::COMPUTE_INDICES);
-        int blocks = (msm_size + threads - 1) / threads;
-        compute_bucket_indices_kernel<<<blocks, threads, 0, stream>>>(
-            d_bucket_indices, d_packed_indices, d_scalars, msm_size, c, num_windows, num_buckets
-        );
+        auto cfg = get_msm_launch_config(msm_size, KernelType::BUCKET_COUNT);
+        
+        if (cfg.use_persistent) {
+            // Use persistent-thread pattern for small MSM sizes
+            // Launch enough blocks to occupy all SMs, each thread processes multiple scalars
+            compute_bucket_indices_persistent_kernel<S><<<cfg.blocks, cfg.threads, 0, stream>>>(
+                d_bucket_indices, d_packed_indices, d_scalars, msm_size, c, num_windows, num_buckets, msm_size
+            );
+        } else {
+            // Standard kernel for larger MSM sizes
+            compute_bucket_indices_kernel<<<cfg.blocks, cfg.threads, 0, stream>>>(
+                d_bucket_indices, d_packed_indices, d_scalars, msm_size, c, num_windows, num_buckets
+            );
+        }
         MSM_CUDA_CHECK(cudaGetLastError());
     }
     
@@ -786,10 +993,8 @@ cudaError_t msm_cuda(
         MSM_CUDA_CHECK(cudaMemsetAsync(d_bucket_sizes, 0, total_buckets * sizeof(unsigned int), stream));
         
         // Use optimized warp-aggregated histogram kernel (reduces atomics by up to 32×)
-        int gpu_capability = get_gpu_compute_capability();
-        int threads = get_optimal_block_size(gpu_capability, KernelType::HISTOGRAM);
-        int blocks = (num_contributions + threads - 1) / threads;
-        histogram_warp_aggregated_kernel<<<blocks, threads, 0, stream>>>(
+        auto cfg = get_launch_config(num_contributions, KernelType::ATOMIC_BOUND);
+        histogram_warp_aggregated_kernel<<<cfg.blocks, cfg.threads, 0, stream>>>(
             d_bucket_sizes, d_bucket_indices, num_contributions, total_buckets);
         MSM_CUDA_CHECK(cudaGetLastError());
     }
@@ -831,50 +1036,93 @@ cudaError_t msm_cuda(
     }
     
     // 5. Accumulate Sorted
+    // Use cooperative kernel for small MSM sizes
+    // to increase parallelism by using multiple threads per bucket
     {
-        int gpu_capability = get_gpu_compute_capability();
-        int threads = get_optimal_block_size(gpu_capability, KernelType::ACCUMULATE);
-        int blocks = (total_buckets + threads - 1) / threads;
+        constexpr int THREADS_PER_BUCKET = 8;  // 8 threads cooperate per bucket
+        int threads = GPUConfig::get().get_cooperative_threads(THREADS_PER_BUCKET);
         
-        // Template instantiation: A = Affine type, P = Projective type
-        accumulate_sorted_kernel<A, P><<<blocks, threads, 0, stream>>>(
-            d_buckets,
-            d_packed_indices_sorted,
-            d_bases,
-            d_bucket_offsets,
-            d_bucket_sizes,
-            total_buckets
-        );
+        // Decide whether to use cooperative kernel based on MSM size
+        if (should_use_cooperative_accumulate(msm_size, total_buckets, threads)) {
+            // Cooperative kernel: multiple threads per bucket
+            auto cfg = get_msm_cooperative_config(total_buckets, THREADS_PER_BUCKET, sizeof(P));
+            accumulate_cooperative_kernel<A, P, THREADS_PER_BUCKET><<<cfg.blocks, cfg.threads, cfg.shared_mem, stream>>>(
+                d_buckets,
+                d_packed_indices_sorted,
+                d_bases,
+                d_bucket_offsets,
+                d_bucket_sizes,
+                total_buckets
+            );
+        } else {
+            // Standard kernel: one thread per bucket
+            auto cfg = get_launch_config(total_buckets, KernelType::BUCKET_REDUCE);
+            accumulate_sorted_kernel<A, P><<<cfg.blocks, cfg.threads, 0, stream>>>(
+                d_buckets,
+                d_packed_indices_sorted,
+                d_bases,
+                d_bucket_offsets,
+                d_bucket_sizes,
+                total_buckets
+            );
+        }
         MSM_CUDA_CHECK(cudaGetLastError());
     }
     
     // 6. Bucket Reduction
+    // Use multi-threaded reduction for large bucket counts
+    // Each block processes one window with multiple threads cooperating
     {
-        int gpu_capability = get_gpu_compute_capability();
-        int optimal_threads = get_optimal_block_size(gpu_capability, KernelType::REDUCTION);
-        int threads = min(num_windows, optimal_threads);
-        int blocks = (num_windows + threads - 1) / threads;
+        auto cfg = get_msm_reduction_config(num_windows, num_buckets, sizeof(P));
         
-        // Template instantiation: P = Projective type
-        parallel_bucket_reduction_kernel<P><<<blocks, threads, 0, stream>>>(
-            d_window_results,
-            d_buckets,
-            num_windows,
-            num_buckets,
-            num_buckets + 1 // buckets_per_window
-        );
+        if (num_buckets >= 256) {
+            // Multi-threaded: one block per window
+            parallel_bucket_reduction_multithread_kernel<P><<<cfg.blocks, cfg.threads, cfg.shared_mem, stream>>>(
+                d_window_results,
+                d_buckets,
+                num_windows,
+                num_buckets,
+                num_buckets + 1 // buckets_per_window
+            );
+        } else {
+            // Simple: one thread per window
+            parallel_bucket_reduction_kernel<P><<<cfg.blocks, cfg.threads, 0, stream>>>(
+                d_window_results,
+                d_buckets,
+                num_windows,
+                num_buckets,
+                num_buckets + 1 // buckets_per_window
+            );
+        }
         MSM_CUDA_CHECK(cudaGetLastError());
     }
     
     // Final accumulation
+    // Use parallel kernel for final window combination
+    // Each thread handles one window's doublings in parallel
     {
-        // Template instantiation: P = Projective type
-        final_accumulation_kernel<P><<<1, 1, 0, stream>>>(
-            d_result,
-            d_window_results,
-            num_windows,
-            c
-        );
+        // Use parallel kernel when we have enough windows to benefit
+        if (num_windows >= 4) {
+            // Round up to next power of 2 for efficient reduction
+            int threads = 32;  // Use one warp - windows are typically < 32
+            while (threads < num_windows) threads *= 2;
+            if (threads > 256) threads = 256;  // Cap at reasonable size
+            
+            final_accumulation_parallel_kernel<P><<<1, threads, 0, stream>>>(
+                d_result,
+                d_window_results,
+                num_windows,
+                c
+            );
+        } else {
+            // Use original sequential kernel for small window counts
+            final_accumulation_kernel<P><<<1, 1, 0, stream>>>(
+                d_result,
+                d_window_results,
+                num_windows,
+                c
+            );
+        }
         MSM_CUDA_CHECK(cudaGetLastError());
     }
     

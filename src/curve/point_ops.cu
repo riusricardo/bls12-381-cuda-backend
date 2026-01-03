@@ -44,10 +44,12 @@
 
 #include "point.cuh"
 #include "icicle_types.cuh"
+#include "gpu_config.cuh"
 
 namespace curve {
 
 using namespace bls12_381;
+using namespace gpu;
 
 // =============================================================================
 // Batch Point Operations
@@ -90,11 +92,10 @@ void batch_projective_to_affine_g1(
     int size,
     cudaStream_t stream
 ) {
-    // Optimal thread count for memory-bound point operations
-    const int threads = 256;
-    const int blocks = (size + threads - 1) / threads;
+    // Point conversion requires field inversion - compute-bound
+    auto cfg = get_launch_config(size, KernelType::POINT_ARITHMETIC);
     
-    batch_projective_to_affine_g1_naive_kernel<<<blocks, threads, 0, stream>>>(
+    batch_projective_to_affine_g1_naive_kernel<<<cfg.blocks, cfg.threads, 0, stream>>>(
         d_output, d_input, size
     );
 }
@@ -782,11 +783,10 @@ void batch_projective_to_affine_g2(
     int size,
     cudaStream_t stream
 ) {
-    // Optimal thread count for memory-bound point operations
-    const int threads = 256;
-    const int blocks = (size + threads - 1) / threads;
+    // Point conversion requires field inversion - compute-bound
+    auto cfg = get_launch_config(size, KernelType::POINT_ARITHMETIC);
     
-    batch_projective_to_affine_g2_naive_kernel<<<blocks, threads, 0, stream>>>(
+    batch_projective_to_affine_g2_naive_kernel<<<cfg.blocks, cfg.threads, 0, stream>>>(
         d_output, d_input, size
     );
 }
@@ -798,10 +798,6 @@ void batch_projective_to_affine_g2(
 // =============================================================================
 
 namespace {
-    // Optimal thread count for memory-bound point operations
-    // 256 threads provides good occupancy on all GPU architectures (SM 5.0+)
-    constexpr int POINT_OP_THREADS = 256;
-    
     // Maximum batch size to prevent integer overflow and excessive memory usage
     // 2^26 = 64M points (reasonable upper limit for batch operations)
     constexpr int MAX_POINT_BATCH_SIZE = (1 << 26);
@@ -867,12 +863,10 @@ eIcicleError bls12_381_g1_affine_to_projective(
         }
     }
     
-    // Launch kernel with overflow-safe block calculation
-    const int threads = POINT_OP_THREADS;
-    const int64_t safe_blocks = ((int64_t)size + threads - 1) / threads;
-    const int blocks = static_cast<int>(safe_blocks);
+    // Launch kernel with optimal thread configuration
+    auto cfg = gpu::get_launch_config(size, gpu::KernelType::POINT_ARITHMETIC);
     
-    curve::batch_affine_to_projective_g1_kernel<<<blocks, threads, 0, stream>>>(
+    curve::batch_affine_to_projective_g1_kernel<<<cfg.blocks, cfg.threads, 0, stream>>>(
         d_output, d_input, size
     );
     
@@ -1151,11 +1145,9 @@ eIcicleError bls12_381_g1_scalar_mul_glv(
     
     // Launch GLV kernel
     // Use fewer threads per block due to high register usage from precomputation tables
-    const int threads = 128;
-    const int64_t safe_blocks = ((int64_t)size + threads - 1) / threads;
-    const int blocks = static_cast<int>(safe_blocks);
+    auto cfg = gpu::get_launch_config(size, gpu::KernelType::SCALAR_MUL);
     
-    curve::batch_scalar_mul_g1_glv_kernel<<<blocks, threads, 0, stream>>>(
+    curve::batch_scalar_mul_g1_glv_kernel<<<cfg.blocks, cfg.threads, 0, stream>>>(
         d_output, d_bases, d_scalars, size
     );
     
@@ -1282,11 +1274,10 @@ eIcicleError bls12_381_g1_scalar_mul(
     }
     
     // Launch standard (non-GLV) kernel
-    const int threads = 128;
-    const int64_t safe_blocks = ((int64_t)size + threads - 1) / threads;
-    const int blocks = static_cast<int>(safe_blocks);
+    // SCALAR_MUL uses 128 threads due to high register pressure from precomputation table
+    auto cfg = gpu::get_launch_config(size, gpu::KernelType::SCALAR_MUL);
     
-    curve::batch_scalar_mul_g1_kernel<<<blocks, threads, 0, stream>>>(
+    curve::batch_scalar_mul_g1_kernel<<<cfg.blocks, cfg.threads, 0, stream>>>(
         d_output, d_bases, d_scalars, size
     );
     

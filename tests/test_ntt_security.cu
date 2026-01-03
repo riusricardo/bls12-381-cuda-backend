@@ -904,6 +904,86 @@ TestResult test_ntt_determinism() {
     return TestResult::PASSED;
 }
 
+/**
+ * @brief Test: Small batch NTT (exercises warp-parallel kernel)
+ * 
+ * Tests batch processing with small NTT sizes (≤32) which should
+ * trigger the optimized warp-parallel kernel path.
+ */
+TestResult test_ntt_small_batch() {
+    const int log_n = 4;  // 16 elements - small enough for warp kernel
+    const int n = 1 << log_n;
+    const int batch_size = 64;  // Many small NTTs in parallel
+    
+    std::mt19937_64 rng(777);
+    
+    std::vector<Fr> input(n * batch_size);
+    for (int i = 0; i < n * batch_size; i++) {
+        input[i] = random_fr_montgomery(rng);
+    }
+    
+    Fr *d_input, *d_ntt, *d_output;
+    SECURITY_CHECK_CUDA(cudaMalloc(&d_input, n * batch_size * sizeof(Fr)));
+    SECURITY_CHECK_CUDA(cudaMalloc(&d_ntt, n * batch_size * sizeof(Fr)));
+    SECURITY_CHECK_CUDA(cudaMalloc(&d_output, n * batch_size * sizeof(Fr)));
+    
+    SECURITY_CHECK_CUDA(cudaMemcpy(d_input, input.data(), n * batch_size * sizeof(Fr), cudaMemcpyHostToDevice));
+    
+    icicle::NTTConfig<Fr> config = default_ntt_config<Fr>();
+    config.stream = nullptr;
+    config.coset_gen = Fr::zero();
+    config.batch_size = batch_size;
+    config.columns_batch = false;
+    config.ordering = Ordering::kNN;
+    config.are_inputs_on_device = true;
+    config.are_outputs_on_device = true;
+    config.is_async = false;
+    config.ext = nullptr;
+    
+    // Forward NTT (should use warp kernel for size 16, batch 64)
+    eIcicleError err = bls12_381_ntt_cuda(d_input, n, NTTDir::kForward, &config, d_ntt);
+    if (err != eIcicleError::SUCCESS) {
+        std::cout << "\n    Small batch forward NTT failed";
+        cudaFree(d_input);
+        cudaFree(d_ntt);
+        cudaFree(d_output);
+        return TestResult::FAILED;
+    }
+    
+    // Inverse NTT
+    err = bls12_381_ntt_cuda(d_ntt, n, NTTDir::kInverse, &config, d_output);
+    if (err != eIcicleError::SUCCESS) {
+        std::cout << "\n    Small batch inverse NTT failed";
+        cudaFree(d_input);
+        cudaFree(d_ntt);
+        cudaFree(d_output);
+        return TestResult::FAILED;
+    }
+    
+    // Verify roundtrip for all batches
+    std::vector<Fr> output(n * batch_size);
+    SECURITY_CHECK_CUDA(cudaMemcpy(output.data(), d_output, n * batch_size * sizeof(Fr), cudaMemcpyDeviceToHost));
+    
+    bool all_match = true;
+    for (int i = 0; i < n * batch_size; i++) {
+        if (memcmp(&input[i], &output[i], sizeof(Fr)) != 0) {
+            all_match = false;
+            break;
+        }
+    }
+    
+    cudaFree(d_input);
+    cudaFree(d_ntt);
+    cudaFree(d_output);
+    
+    if (!all_match) {
+        std::cout << "\n    Small batch roundtrip mismatch";
+        return TestResult::FAILED;
+    }
+    
+    return TestResult::PASSED;
+}
+
 // =============================================================================
 // Registration
 // =============================================================================
@@ -926,6 +1006,8 @@ void register_ntt_tests(SecurityTestSuite& suite) {
                    test_ntt_various_sizes);
     suite.add_test("NTT: batch processing", "NTT Scale",
                    test_ntt_batch);
+    suite.add_test("NTT: small batch (warp kernel)", "NTT Scale",
+                   test_ntt_small_batch);
     
     // Security properties
     suite.add_test("NTT: determinism", "NTT Security",

@@ -778,6 +778,133 @@ TestResult test_msm_generator_on_curve() {
     return TestResult::PASSED;
 }
 
+/**
+ * @brief Test: Large MSM (10K points)
+ * 
+ * Stress-test with 10,000 points to exercise large-scale parallelism.
+ */
+TestResult test_msm_large_10k() {
+    const int n = 10000;
+    std::mt19937_64 rng(10000);
+    
+    G1Affine gen = make_g1_generator();
+    
+    // Generate random scalars in integer form
+    std::vector<Fr> scalars(n);
+    for (int i = 0; i < n; i++) {
+        scalars[i] = random_fr_integer(rng);
+    }
+    
+    // Use generator for all bases
+    std::vector<G1Affine> bases(n, gen);
+    
+    MSMConfig config = icicle::default_msm_config();
+    config.stream = nullptr;
+    config.are_scalars_on_device = false;
+    config.are_points_on_device = false;
+    config.are_results_on_device = false;
+    config.is_async = false;
+    config.ext = nullptr;
+    
+    G1Projective result;
+    eIcicleError err = bls12_381_g1_msm_cuda(scalars.data(), bases.data(), n, &config, &result);
+    
+    if (err != eIcicleError::SUCCESS) {
+        std::cout << "\n    MSM returned error";
+        return TestResult::FAILED;
+    }
+    
+    // Verify result is not identity (astronomically unlikely for random scalars)
+    if (result.is_identity()) {
+        std::cout << "\n    MSM result unexpectedly identity";
+        return TestResult::FAILED;
+    }
+    
+    return TestResult::PASSED;
+}
+
+/**
+ * @brief Test: Large MSM (50K points)
+ */
+TestResult test_msm_large_50k() {
+    const int n = 50000;
+    std::mt19937_64 rng(50000);
+    
+    G1Affine gen = make_g1_generator();
+    
+    std::vector<Fr> scalars(n);
+    for (int i = 0; i < n; i++) {
+        scalars[i] = random_fr_integer(rng);
+    }
+    
+    std::vector<G1Affine> bases(n, gen);
+    
+    MSMConfig config = icicle::default_msm_config();
+    config.stream = nullptr;
+    config.are_scalars_on_device = false;
+    config.are_points_on_device = false;
+    config.are_results_on_device = false;
+    config.is_async = false;
+    config.ext = nullptr;
+    
+    G1Projective result;
+    eIcicleError err = bls12_381_g1_msm_cuda(scalars.data(), bases.data(), n, &config, &result);
+    
+    if (err != eIcicleError::SUCCESS) {
+        std::cout << "\n    MSM returned error";
+        return TestResult::FAILED;
+    }
+    
+    if (result.is_identity()) {
+        std::cout << "\n    MSM result unexpectedly identity";
+        return TestResult::FAILED;
+    }
+    
+    return TestResult::PASSED;
+}
+
+/**
+ * @brief Test: Large MSM (100K points)
+ * 
+ * Maximum stress test with 100,000 points.
+ */
+TestResult test_msm_large_100k() {
+    const int n = 100000;
+    std::mt19937_64 rng(100000);
+    
+    G1Affine gen = make_g1_generator();
+    
+    std::vector<Fr> scalars(n);
+    for (int i = 0; i < n; i++) {
+        scalars[i] = random_fr_integer(rng);
+    }
+    
+    std::vector<G1Affine> bases(n, gen);
+    
+    MSMConfig config = icicle::default_msm_config();
+    config.stream = nullptr;
+    config.are_scalars_on_device = false;
+    config.are_points_on_device = false;
+    config.are_results_on_device = false;
+    config.is_async = false;
+    config.ext = nullptr;
+    
+    G1Projective result;
+    eIcicleError err = bls12_381_g1_msm_cuda(scalars.data(), bases.data(), n, &config, &result);
+    
+    if (err != eIcicleError::SUCCESS) {
+        std::cout << "\n    MSM returned error";
+        return TestResult::FAILED;
+    }
+    
+    if (result.is_identity()) {
+        std::cout << "\n    MSM result unexpectedly identity";
+        return TestResult::FAILED;
+    }
+    
+    return TestResult::PASSED;
+}
+
 void register_msm_tests(SecurityTestSuite& suite) {
     // Generator verification (CRITICAL - must come first)
     suite.add_test("MSM: Generator on curve y² = x³ + 4", "MSM Prerequisites",
@@ -804,6 +931,12 @@ void register_msm_tests(SecurityTestSuite& suite) {
     // Scale and consistency
     suite.add_test("MSM: medium size (1024)", "MSM Scale",
                    test_msm_medium_size);
+    suite.add_test("MSM: large size (10K)", "MSM Scale",
+                   test_msm_large_10k);
+    suite.add_test("MSM: large size (50K)", "MSM Scale",
+                   test_msm_large_50k);
+    suite.add_test("MSM: large size (100K)", "MSM Scale",
+                   test_msm_large_100k);
     suite.add_test("MSM: deterministic results", "MSM Consistency",
                    test_msm_window_consistency);
 }

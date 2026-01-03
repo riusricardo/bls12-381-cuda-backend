@@ -48,6 +48,9 @@
 #ifdef ECNTT_ENABLED
 
 #include "point.cuh"
+#include "gpu_config.cuh"
+
+using namespace gpu;
 #include "ntt.cuh"
 #include "icicle_types.cuh"
 
@@ -167,7 +170,7 @@ cudaError_t ecntt_forward(
     int size,
     cudaStream_t stream
 ) {
-    const int threads = 256;
+    auto cfg = get_launch_config(size, KernelType::POINT_ARITHMETIC);
     int log_size = 0;
     while ((1 << log_size) < size) log_size++;
     
@@ -178,8 +181,7 @@ cudaError_t ecntt_forward(
     err = cudaMalloc(&d_temp, size * sizeof(G1Projective));
     if (err != cudaSuccess) return err;
     
-    int blocks = (size + threads - 1) / threads;
-    ecntt_bit_reverse_kernel<<<blocks, threads, 0, stream>>>(
+    ecntt_bit_reverse_kernel<<<cfg.blocks, cfg.threads, 0, stream>>>(
         d_temp, d_data, size, log_size
     );
     err = cudaGetLastError();
@@ -202,9 +204,9 @@ cudaError_t ecntt_forward(
         int half_step = step / 2;
         
         int num_ops = size / 2;
-        blocks = (num_ops + threads - 1) / threads;
+        auto cfg_butterfly = get_launch_config(num_ops, KernelType::POINT_ARITHMETIC);
         
-        ecntt_butterfly_kernel<<<blocks, threads, 0, stream>>>(
+        ecntt_butterfly_kernel<<<cfg_butterfly.blocks, cfg_butterfly.threads, 0, stream>>>(
             d_data, d_twiddles, size, step, half_step
         );
         
@@ -234,7 +236,7 @@ cudaError_t ecntt_inverse(
     // The caller is responsible for scaling the result if needed.
     // This matches ICICLE's behavior where normalization is optional.
     (void)inv_size;
-    const int threads = 256;
+    auto cfg = get_launch_config(size, KernelType::POINT_ARITHMETIC);
     int log_size = 0;
     while ((1 << log_size) < size) log_size++;
     
@@ -247,9 +249,9 @@ cudaError_t ecntt_inverse(
         int half_step = step / 2;
         
         int num_ops = size / 2;
-        int blocks = (num_ops + threads - 1) / threads;
+        auto cfg_butterfly = get_launch_config(num_ops, KernelType::POINT_ARITHMETIC);
         
-        ecntt_butterfly_kernel<<<blocks, threads, 0, stream>>>(
+        ecntt_butterfly_kernel<<<cfg_butterfly.blocks, cfg_butterfly.threads, 0, stream>>>(
             d_data, d_inv_twiddles, size, step, half_step
         );
         
@@ -265,8 +267,7 @@ cudaError_t ecntt_inverse(
     err = cudaMalloc(&d_temp, size * sizeof(G1Projective));
     if (err != cudaSuccess) return err;
     
-    int blocks = (size + threads - 1) / threads;
-    ecntt_bit_reverse_kernel<<<blocks, threads, 0, stream>>>(
+    ecntt_bit_reverse_kernel<<<cfg.blocks, cfg.threads, 0, stream>>>(
         d_temp, d_data, size, log_size
     );
     err = cudaGetLastError();

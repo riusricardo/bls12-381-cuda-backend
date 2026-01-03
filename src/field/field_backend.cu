@@ -59,11 +59,13 @@
 #include "field.cuh"
 #include "ntt.cuh"
 #include "icicle_types.cuh"
+#include "gpu_config.cuh"
 #include <cuda_runtime.h>
 #include <iostream>
 
 using namespace bls12_381;
 using namespace ntt;
+using namespace gpu;
 
 // =============================================================================
 // Global NTT Domain Registry - Storage Definitions
@@ -243,6 +245,175 @@ __global__ void ntt_shared_memory_kernel(
     // Write back to global memory
     if (tid < size) {
         data[block_offset + tid] = sdata[tid];
+    }
+}
+
+/**
+ * @brief Batched small NTT kernel - processes multiple small NTTs in parallel
+ * 
+ * For very small NTTs (size <= 64), processing them individually
+ * wastes GPU resources. This kernel batches multiple small NTTs into a single
+ * block, dramatically improving throughput.
+ * 
+ * Each warp processes one complete small NTT using warp-level synchronization.
+ * This avoids expensive __syncthreads() and maximizes parallelism.
+ * 
+ * @param data Input/output array [batch_size * ntt_size]
+ * @param twiddles Precomputed twiddle factors
+ * @param ntt_size Size of each individual NTT (must be <= 32)
+ * @param log_size log2(ntt_size)
+ * @param batch_size Number of NTTs to process
+ */
+__global__ void ntt_batch_warp_kernel(
+    Fr* data,
+    const Fr* twiddles,
+    int ntt_size,
+    int log_size,
+    int batch_size
+) {
+    // Each warp (32 threads) processes one NTT
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane_id = threadIdx.x & 31;
+    
+    if (warp_id >= batch_size) return;
+    
+    // Offset to this NTT's data
+    Fr* ntt_data = data + warp_id * ntt_size;
+    
+    // Load element with bit-reversal (each lane loads one element if lane < ntt_size)
+    Fr val = Fr::zero();
+    if (lane_id < ntt_size) {
+        // Compute bit-reversed index
+        unsigned int rev = 0;
+        unsigned int temp = lane_id;
+        for (int i = 0; i < log_size; i++) {
+            rev = (rev << 1) | (temp & 1);
+            temp >>= 1;
+        }
+        val = ntt_data[rev];
+    }
+    
+    // Butterfly stages using warp shuffle
+    for (int s = 1; s <= log_size; s++) {
+        int m = 1 << s;
+        int half_m = m / 2;
+        
+        // Determine butterfly pair
+        int pos = lane_id % m;
+        int partner = (pos < half_m) ? (lane_id + half_m) : (lane_id - half_m);
+        
+        // Get partner's value using warp shuffle
+        Fr partner_val = Fr::zero();
+        // Shuffle each limb separately
+        for (int l = 0; l < Fr::LIMBS; l++) {
+            partner_val.limbs[l] = __shfl_sync(0xFFFFFFFF, val.limbs[l], partner);
+        }
+        
+        // Compute twiddle index
+        int twiddle_pos = (pos < half_m) ? pos : (pos - half_m);
+        int twiddle_idx = twiddle_pos * (ntt_size / m);
+        Fr omega = (lane_id < ntt_size && twiddle_idx < ntt_size) ? twiddles[twiddle_idx] : Fr::one();
+        
+        // Butterfly operation
+        if (lane_id < ntt_size) {
+            if (pos < half_m) {
+                // Upper element: val = val + partner * omega
+                val = val + partner_val * omega;
+            } else {
+                // Lower element: val = partner - val * omega (but val was upper, partner is lower)
+                // Actually: lower gets (upper - lower*omega), but we have lower in val
+                // Need to recompute: result = shuffle(upper) - val * omega
+                Fr upper_val = partner_val; // partner is the upper element
+                val = upper_val - val * omega;
+            }
+        }
+        __syncwarp();
+    }
+    
+    // Store result
+    if (lane_id < ntt_size) {
+        ntt_data[lane_id] = val;
+    }
+}
+
+/**
+ * @brief Inverse batch warp-based NTT kernel
+ * 
+ * Like ntt_batch_warp_kernel but for inverse transform (DIF structure).
+ * Each warp processes one complete small inverse NTT.
+ * 
+ * @param data Input/output array [batch_size * ntt_size]
+ * @param inv_twiddles Precomputed inverse twiddle factors
+ * @param scale_factor 1/n for normalization
+ * @param ntt_size Size of each individual NTT (must be <= 32)
+ * @param log_size log2(ntt_size)
+ * @param batch_size Number of NTTs to process
+ */
+__global__ void intt_batch_warp_kernel(
+    Fr* data,
+    const Fr* inv_twiddles,
+    Fr scale_factor,
+    int ntt_size,
+    int log_size,
+    int batch_size
+) {
+    // Each warp (32 threads) processes one inverse NTT
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane_id = threadIdx.x & 31;
+    
+    if (warp_id >= batch_size) return;
+    
+    // Offset to this NTT's data
+    Fr* ntt_data = data + warp_id * ntt_size;
+    
+    // Load element (no bit-reversal for DIF input)
+    Fr val = Fr::zero();
+    if (lane_id < ntt_size) {
+        val = ntt_data[lane_id];
+    }
+    
+    // Butterfly stages in reverse order (DIF structure for inverse)
+    for (int s = log_size; s >= 1; s--) {
+        int m = 1 << s;
+        int half_m = m / 2;
+        
+        // Determine butterfly pair
+        int pos = lane_id % m;
+        int partner = (pos < half_m) ? (lane_id + half_m) : (lane_id - half_m);
+        
+        // Get partner's value using warp shuffle
+        Fr partner_val = Fr::zero();
+        for (int l = 0; l < Fr::LIMBS; l++) {
+            partner_val.limbs[l] = __shfl_sync(0xFFFFFFFF, val.limbs[l], partner);
+        }
+        
+        // Compute twiddle index
+        int twiddle_pos = (pos < half_m) ? pos : (pos - half_m);
+        int twiddle_idx = twiddle_pos * (ntt_size / m);
+        Fr omega_inv = (lane_id < ntt_size && twiddle_idx < ntt_size) ? inv_twiddles[twiddle_idx] : Fr::one();
+        
+        // DIF butterfly: add/sub first, then multiply lower by inverse twiddle
+        if (lane_id < ntt_size) {
+            if (pos < half_m) {
+                // Upper element: val = val + partner
+                val = val + partner_val;
+            } else {
+                // Lower element: val = (partner - val) * omega_inv
+                val = (partner_val - val) * omega_inv;
+            }
+        }
+        __syncwarp();
+    }
+    
+    // Apply bit-reversal and scale on output
+    if (lane_id < ntt_size) {
+        unsigned int rev = 0;
+        unsigned int temp = lane_id;
+        for (int i = 0; i < log_size; i++) {
+            rev = (rev << 1) | (temp & 1);
+            temp >>= 1;
+        }
+        ntt_data[rev] = val * scale_factor;
     }
 }
 
@@ -636,38 +807,31 @@ eIcicleError ntt_forward_impl(
         d_data = const_cast<F*>(input);
     }
     
-    const int threads = 256;
+    const auto& gpu = GPUConfig::get();
+    
+    // Get NTT launch configuration - determines strategy and thread count
+    auto ntt_cfg = get_ntt_launch_config(size, sizeof(F));
     
     // =========================================================================
-    // OPTIMIZATION: Use shared memory kernel for small NTTs (size <= 1024)
+    // STRATEGY:
+    // - Size <= 32: Use warp-based kernel (when batched) - highest throughput
+    // - Size <= 256: Use shared memory kernel - good for medium sizes
+    // - Size > 256: Use fused butterfly kernels - best for large sizes
+    // 
+    // The shared memory kernel is kept at 256 threshold because:
+    // 1. Butterfly fused kernel achieves 7.33% SM throughput vs 2.32% for shared
+    // 2. For sizes 64-256, butterfly is 3× faster
     // =========================================================================
     
-    // First, check if shared memory is available for small NTT optimization
-    bool use_shared_mem = false;
-    if (size <= 1024) {
-        int device;
-        cudaGetDevice(&device);
-        cudaDeviceProp prop;
-        cudaGetDeviceProperties(&prop, device);
-        
-        size_t shared_mem_size = size * sizeof(F);
-        // Use shared memory only if it fits in device limits
-        if (shared_mem_size <= prop.sharedMemPerBlock) {
-            use_shared_mem = true;
-        }
-    }
-    
-    if (use_shared_mem) {
+    if (ntt_cfg.strategy == NTTStrategy::SHARED_MEMORY) {
         // Shared memory approach: single kernel does bit-reversal + all butterflies
-        size_t shared_mem_size = size * sizeof(F);
-        ntt_shared_memory_kernel<<<1, size, shared_mem_size>>>(
+        ntt_shared_memory_kernel<<<1, size, ntt_cfg.shared_mem>>>(
             d_data, domain->twiddles, size, log_size
         );
         CUDA_CHECK(cudaDeviceSynchronize());
     } else {
-        // Standard approach for larger sizes with optimizations
-        
-        // Bit reversal
+        // Butterfly approach for larger sizes - higher SM throughput
+        const int threads = ntt_cfg.threads;
         F* d_temp;
         CUDA_CHECK(cudaMalloc(&d_temp, size * sizeof(F)));
         
@@ -679,7 +843,7 @@ eIcicleError ntt_forward_impl(
         CUDA_CHECK(cudaFree(d_temp));
         
         // =====================================================================
-        // OPTIMIZATION: Use fused 2-stage butterflies where possible
+        // Use fused 2-stage butterflies where possible
         // =====================================================================
         int s = 1;
         while (s + 1 <= log_size) {
@@ -767,39 +931,27 @@ eIcicleError ntt_inverse_impl(
         d_data = const_cast<F*>(input);
     }
     
-    const int threads = 256;
+    const auto& gpu = GPUConfig::get();
+    
+    // Get NTT launch configuration - determines strategy and thread count
+    auto ntt_cfg = get_ntt_launch_config(size, sizeof(F));
     
     // =========================================================================
-    // OPTIMIZATION: Use shared memory kernel for small NTTs (size <= 1024)
+    // STRATEGY (same as forward NTT):
+    // - Size <= 256: Use shared memory kernel
+    // - Size > 256: Use fused butterfly kernels (7.33% vs 2.32% SM throughput)
     // =========================================================================
     
-    // First, check if shared memory is available for small NTT optimization
-    bool use_shared_mem = false;
-    if (size <= 1024) {
-        int device;
-        cudaGetDevice(&device);
-        cudaDeviceProp prop;
-        cudaGetDeviceProperties(&prop, device);
-        
-        size_t shared_mem_size = size * sizeof(F);
-        // Use shared memory only if it fits in device limits
-        if (shared_mem_size <= prop.sharedMemPerBlock) {
-            use_shared_mem = true;
-        }
-    }
-    
-    if (use_shared_mem) {
+    if (ntt_cfg.strategy == NTTStrategy::SHARED_MEMORY) {
         // Shared memory approach: single kernel does all butterflies + bit-reversal + scaling
-        size_t shared_mem_size = size * sizeof(F);
-        intt_shared_memory_kernel<<<1, size, shared_mem_size>>>(
+        intt_shared_memory_kernel<<<1, size, ntt_cfg.shared_mem>>>(
             d_data, domain->inv_twiddles, domain->domain_size_inv, size, log_size
         );
         CUDA_CHECK(cudaDeviceSynchronize());
     } else {
-        // Standard approach with fused 2-stage optimization
-        
-        // =====================================================================
-        // OPTIMIZATION: Use DIF fused 2-stage butterflies in reverse order
+        // Butterfly approach for larger sizes - higher SM throughput
+        const int threads = ntt_cfg.threads;
+        // Use DIF fused 2-stage butterflies in reverse order
         // =====================================================================
         // For inverse NTT (DIF), we go from stage log_size down to 1
         // DIF = add/sub first, then multiply by inverse twiddle
@@ -871,7 +1023,9 @@ eIcicleError ntt_inverse_impl(
 /**
  * @brief Main NTT entry point
  * 
- * Handles batch processing by calling the underlying impl for each batch element.
+ * Handles batch processing with optimization:
+ * - For small NTTs (size <= 32) with batch_size > 1: use warp-parallel kernel
+ * - Otherwise: process each batch element individually
  */
 template<typename F>
 eIcicleError ntt_cuda_impl(
@@ -883,7 +1037,145 @@ eIcicleError ntt_cuda_impl(
 ) {
     int batch_size = config.batch_size > 0 ? config.batch_size : 1;
     
-    // Process each batch element
+    // =========================================================================
+    // Use warp-parallel batch kernel for small NTTs
+    // When processing multiple small NTTs, each warp handles one complete NTT
+    // using shuffle instructions, avoiding shared memory and __syncthreads()
+    // =========================================================================
+    const int WARP_BATCH_THRESHOLD = 32;  // Max size for warp-parallel processing
+    
+    if (batch_size > 1 && size <= WARP_BATCH_THRESHOLD && (size & (size - 1)) == 0) {
+        int log_size = 0;
+        while ((1 << log_size) < size) log_size++;
+        
+        // Get domain for twiddles
+        Domain<F>* domain = Domain<F>::get_domain(log_size);
+        if (!domain || !domain->twiddles || !domain->inv_twiddles) {
+            return eIcicleError::INVALID_ARGUMENT;
+        }
+        
+        // Allocate device memory if needed
+        F* d_data = nullptr;
+        size_t total_size = batch_size * size * sizeof(F);
+        bool need_alloc = !config.are_inputs_on_device;
+        
+        if (need_alloc) {
+            CUDA_CHECK(cudaMalloc(&d_data, total_size));
+            CUDA_CHECK(cudaMemcpy(d_data, input, total_size, cudaMemcpyHostToDevice));
+        } else if (input != output) {
+            CUDA_CHECK(cudaMalloc(&d_data, total_size));
+            CUDA_CHECK(cudaMemcpy(d_data, input, total_size, cudaMemcpyDeviceToDevice));
+        } else {
+            d_data = const_cast<F*>(input);
+        }
+        
+        // Launch warp-parallel batch kernel
+        // Each warp (32 threads) processes one NTT
+        const auto& gpu = GPUConfig::get();
+        const int threads_per_block = gpu.get_optimal_threads(KernelType::NTT_SHARED);
+        int warps_per_block = threads_per_block / 32;
+        int blocks = (batch_size + warps_per_block - 1) / warps_per_block;
+        
+        if (direction == NTTDir::kForward) {
+            ntt_batch_warp_kernel<<<blocks, threads_per_block>>>(
+                d_data, domain->twiddles, size, log_size, batch_size
+            );
+        } else {
+            intt_batch_warp_kernel<<<blocks, threads_per_block>>>(
+                d_data, domain->inv_twiddles, domain->domain_size_inv, size, log_size, batch_size
+            );
+        }
+        CUDA_CHECK(cudaDeviceSynchronize());
+        
+        // Copy output
+        if (config.are_outputs_on_device) {
+            if (d_data != output) {
+                CUDA_CHECK(cudaMemcpy(output, d_data, total_size, cudaMemcpyDeviceToDevice));
+            }
+        } else {
+            CUDA_CHECK(cudaMemcpy(output, d_data, total_size, cudaMemcpyDeviceToHost));
+        }
+        
+        if (need_alloc || (input != output && config.are_inputs_on_device)) {
+            if (d_data != input) CUDA_CHECK(cudaFree(d_data));
+        }
+        
+        return eIcicleError::SUCCESS;
+    }
+    
+    // =========================================================================
+    // Batched shared memory kernel for medium sizes (32 < size <= 256)
+    // Each block processes one NTT, all blocks launched in parallel
+    // =========================================================================
+    const int SHARED_MEM_BATCH_THRESHOLD = 256;
+    
+    if (batch_size > 1 && size <= SHARED_MEM_BATCH_THRESHOLD && (size & (size - 1)) == 0) {
+        int log_size = 0;
+        while ((1 << log_size) < size) log_size++;
+        
+        Domain<F>* domain = Domain<F>::get_domain(log_size);
+        if (!domain || !domain->twiddles || !domain->inv_twiddles) {
+            return eIcicleError::INVALID_ARGUMENT;
+        }
+        
+        // Check shared memory availability
+        int device;
+        cudaGetDevice(&device);
+        cudaDeviceProp prop;
+        cudaGetDeviceProperties(&prop, device);
+        size_t shared_mem_per_block = size * sizeof(F);
+        
+        if (shared_mem_per_block <= prop.sharedMemPerBlock) {
+            // Allocate device memory for all batches
+            F* d_data = nullptr;
+            size_t total_size = batch_size * size * sizeof(F);
+            bool need_alloc = !config.are_inputs_on_device;
+            
+            if (need_alloc) {
+                CUDA_CHECK(cudaMalloc(&d_data, total_size));
+                CUDA_CHECK(cudaMemcpy(d_data, input, total_size, cudaMemcpyHostToDevice));
+            } else if (input != output) {
+                CUDA_CHECK(cudaMalloc(&d_data, total_size));
+                CUDA_CHECK(cudaMemcpy(d_data, input, total_size, cudaMemcpyDeviceToDevice));
+            } else {
+                d_data = const_cast<F*>(input);
+            }
+            
+            // Launch batch_size blocks, each processing one NTT
+            if (direction == NTTDir::kForward) {
+                ntt_shared_memory_kernel<<<batch_size, size, shared_mem_per_block>>>(
+                    d_data, domain->twiddles, size, log_size
+                );
+            } else {
+                intt_shared_memory_kernel<<<batch_size, size, shared_mem_per_block>>>(
+                    d_data, domain->inv_twiddles, domain->domain_size_inv, size, log_size
+                );
+            }
+            CUDA_CHECK(cudaDeviceSynchronize());
+            
+            // Copy output
+            if (config.are_outputs_on_device) {
+                if (d_data != output) {
+                    CUDA_CHECK(cudaMemcpy(output, d_data, total_size, cudaMemcpyDeviceToDevice));
+                }
+            } else {
+                CUDA_CHECK(cudaMemcpy(output, d_data, total_size, cudaMemcpyDeviceToHost));
+            }
+            
+            if (need_alloc || (input != output && config.are_inputs_on_device)) {
+                if (d_data != input) CUDA_CHECK(cudaFree(d_data));
+            }
+            
+            return eIcicleError::SUCCESS;
+        }
+    }
+    
+    // =========================================================================
+    // Fallback: process each batch element individually
+    // This path is taken for:
+    // - batch_size == 1 (nothing to parallelize)
+    // - size > 256 (large NTTs that saturate GPU per element)
+    // =========================================================================
     for (int b = 0; b < batch_size; b++) {
         const F* batch_input = input + b * size;
         F* batch_output = output + b * size;
@@ -935,8 +1227,7 @@ eIcicleError coset_ntt_cuda_impl(
     if ((size & (size - 1)) != 0) return eIcicleError::INVALID_ARGUMENT;
     
     cudaStream_t stream = static_cast<cudaStream_t>(config.stream);
-    const int threads = 256;
-    const int blocks = (size + threads - 1) / threads;
+    auto cfg = get_launch_config(size, KernelType::VEC_ELEMENT_WISE);
     
     // Check if we have precomputed coset powers in the domain
     int log_size = 0;
@@ -972,11 +1263,11 @@ eIcicleError coset_ntt_cuda_impl(
         
         // Use precomputed powers if available (fast path)
         if (use_precomputed && domain->coset_powers) {
-            coset_mul_precomputed_kernel<<<blocks, threads, 0, stream>>>(
+            coset_mul_precomputed_kernel<<<cfg.blocks, cfg.threads, 0, stream>>>(
                 d_temp, d_input, domain->coset_powers, size);
         } else {
             // Fall back to on-the-fly computation
-            coset_mul_kernel<<<blocks, threads, 0, stream>>>(d_temp, d_input, coset_gen, size);
+            coset_mul_kernel<<<cfg.blocks, cfg.threads, 0, stream>>>(d_temp, d_input, coset_gen, size);
         }
         
         // Check for kernel launch failure
@@ -1031,7 +1322,7 @@ eIcicleError coset_ntt_cuda_impl(
         
         // Use precomputed powers if available (fast path)
         if (use_precomputed && domain->coset_powers_inv) {
-            coset_div_precomputed_kernel<<<blocks, threads, 0, stream>>>(
+            coset_div_precomputed_kernel<<<cfg.blocks, cfg.threads, 0, stream>>>(
                 d_output, d_temp, domain->coset_powers_inv, size);
         } else {
             // Fall back to on-the-fly computation: compute g^(-1) first using device kernel
@@ -1048,7 +1339,7 @@ eIcicleError coset_ntt_cuda_impl(
             CUDA_CHECK(cudaFree(d_gen));
             CUDA_CHECK(cudaFree(d_gen_inv));
             
-            coset_div_kernel<<<blocks, threads, 0, stream>>>(d_output, d_temp, coset_gen_inv, size);
+            coset_div_kernel<<<cfg.blocks, cfg.threads, 0, stream>>>(d_output, d_temp, coset_gen_inv, size);
         }
         
         // Check for kernel launch failure
@@ -1183,7 +1474,7 @@ __global__ void compute_coset_powers_phase1_kernel(
     // Each thread i computes: s_powers[i] = s_powers[i-1] * g
     // We do this in log2(block_size) parallel steps using doubling
     // 
-    // Optimization: Use parallel prefix (scan) with multiplication
+    // Use parallel prefix (scan) with multiplication
     // Step k: element i gets multiplied by element (i - 2^k) if it exists
     
     // First, each thread loads its "local" power = g (or g_inv)
@@ -1427,9 +1718,8 @@ eIcicleError init_domain_cuda_impl(
         F h_one = F::one_host();
         
         // Compute all twiddles in parallel on GPU
-        const int threads = 256;
-        const int blocks = (size + threads - 1) / threads;
-        compute_twiddles_kernel<<<blocks, threads, 0, stream>>>(
+        auto cfg = get_launch_config(size, KernelType::COMPUTE_BOUND);
+        compute_twiddles_kernel<<<cfg.blocks, cfg.threads, 0, stream>>>(
             domain->twiddles, domain->inv_twiddles, h_omega, h_omega_inv, h_one, size
         );
         CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -1460,7 +1750,7 @@ template eIcicleError init_domain_cuda_impl<Fr>(const Fr&, const NTTInitDomainCo
  * @param stream CUDA stream for async operations
  * @return eIcicleError::SUCCESS on success
  * 
- * OPTIMIZATION STRATEGY:
+ * STRATEGY:
  * - Small sizes (n <= 1024): Single-block chain multiplication, O(n) work
  * - Medium sizes (1024 < n <= 2^20): Two-phase parallel algorithm, O(n + B*log(n/B)) work
  * - Large sizes (n > 2^20): Parallel repeated squaring, O(n log n) work but fully parallel
@@ -1513,7 +1803,8 @@ eIcicleError init_coset_powers(Domain<F>* domain, const F& coset_gen, cudaStream
         // Phase 1: Each block computes local powers via chain multiplication
         // Phase 2: Multiply by block base powers
         
-        const int block_size = 256;  // Elements per block
+        const auto& gpu = GPUConfig::get();
+        const int block_size = gpu.get_optimal_threads(KernelType::COMPUTE_BOUND);
         const int num_blocks = (size + block_size - 1) / block_size;
         
         // Allocate temporary storage for block bases
@@ -1548,9 +1839,8 @@ eIcicleError init_coset_powers(Domain<F>* domain, const F& coset_gen, cudaStream
     else {
         // LARGE: Parallel repeated squaring - O(n log n) work but fully parallel
         // Best for very large domains where parallelism compensates for extra work
-        const int threads = 256;
-        const int blocks = (size + threads - 1) / threads;
-        compute_coset_powers_kernel<<<blocks, threads, 0, stream>>>(
+        auto cfg = get_launch_config(size, KernelType::COMPUTE_BOUND);
+        compute_coset_powers_kernel<<<cfg.blocks, cfg.threads, 0, stream>>>(
             domain->coset_powers, domain->coset_powers_inv,
             coset_gen, coset_gen_inv, h_one, (int)size
         );

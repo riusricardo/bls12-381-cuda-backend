@@ -45,9 +45,11 @@
 
 #include "field.cuh"
 #include "icicle_types.cuh"
+#include "gpu_config.cuh"
 #include <cuda_runtime.h>
 
 using namespace bls12_381;
+using namespace gpu;
 
 namespace vec_ops {
 
@@ -687,10 +689,9 @@ eIcicleError vec_op_impl(
     }
     
     // Launch kernel
-    const int threads = 256;
-    const int blocks = (size + threads - 1) / threads;
+    auto cfg = get_launch_config(size, KernelType::VEC_ELEMENT_WISE);
     
-    kernel<<<blocks, threads, 0, stream>>>(d_output, d_a, d_b, size);
+    kernel<<<cfg.blocks, cfg.threads, 0, stream>>>(d_output, d_a, d_b, size);
     
     // Copy output back if needed
     if (alloc_out) {
@@ -723,10 +724,9 @@ eIcicleError vec_add_cuda(
     const VecOpsConfig& config
 ) {
     cudaStream_t stream = static_cast<cudaStream_t>(config.stream);
-    const int threads = 256;
-    const int blocks = (size + threads - 1) / threads;
+    auto cfg = get_launch_config(size, KernelType::VEC_ELEMENT_WISE);
     
-    vec_ops::vec_add_kernel<<<blocks, threads, 0, stream>>>(output, a, b, size);
+    vec_ops::vec_add_kernel<<<cfg.blocks, cfg.threads, 0, stream>>>(output, a, b, size);
     
     return cudaGetLastError() == cudaSuccess ? 
            eIcicleError::SUCCESS : eIcicleError::UNKNOWN_ERROR;
@@ -740,10 +740,9 @@ eIcicleError vec_sub_cuda(
     const VecOpsConfig& config
 ) {
     cudaStream_t stream = static_cast<cudaStream_t>(config.stream);
-    const int threads = 256;
-    const int blocks = (size + threads - 1) / threads;
+    auto cfg = get_launch_config(size, KernelType::VEC_ELEMENT_WISE);
     
-    vec_ops::vec_sub_kernel<<<blocks, threads, 0, stream>>>(output, a, b, size);
+    vec_ops::vec_sub_kernel<<<cfg.blocks, cfg.threads, 0, stream>>>(output, a, b, size);
     
     return cudaGetLastError() == cudaSuccess ? 
            eIcicleError::SUCCESS : eIcicleError::UNKNOWN_ERROR;
@@ -757,10 +756,9 @@ eIcicleError vec_mul_cuda(
     const VecOpsConfig& config
 ) {
     cudaStream_t stream = static_cast<cudaStream_t>(config.stream);
-    const int threads = 256;
-    const int blocks = (size + threads - 1) / threads;
+    auto cfg = get_launch_config(size, KernelType::VEC_ELEMENT_WISE);
     
-    vec_ops::vec_mul_kernel<<<blocks, threads, 0, stream>>>(output, a, b, size);
+    vec_ops::vec_mul_kernel<<<cfg.blocks, cfg.threads, 0, stream>>>(output, a, b, size);
     
     return cudaGetLastError() == cudaSuccess ? 
            eIcicleError::SUCCESS : eIcicleError::UNKNOWN_ERROR;
@@ -775,10 +773,9 @@ eIcicleError scalar_mul_vec_cuda(
     const VecOpsConfig& config
 ) {
     cudaStream_t stream = static_cast<cudaStream_t>(config.stream);
-    const int threads = 256;
-    const int blocks = (size + threads - 1) / threads;
+    auto cfg = get_launch_config(size, KernelType::VEC_ELEMENT_WISE);
     
-    vec_ops::scalar_vec_mul_kernel<<<blocks, threads, 0, stream>>>(
+    vec_ops::scalar_vec_mul_kernel<<<cfg.blocks, cfg.threads, 0, stream>>>(
         output, *scalar, vec, size
     );
     
@@ -794,10 +791,9 @@ eIcicleError scalar_add_vec_cuda(
     const VecOpsConfig& config
 ) {
     cudaStream_t stream = static_cast<cudaStream_t>(config.stream);
-    const int threads = 256;
-    const int blocks = (size + threads - 1) / threads;
+    auto cfg = get_launch_config(size, KernelType::VEC_ELEMENT_WISE);
     
-    vec_ops::scalar_vec_add_kernel<<<blocks, threads, 0, stream>>>(
+    vec_ops::scalar_vec_add_kernel<<<cfg.blocks, cfg.threads, 0, stream>>>(
         output, *scalar, vec, size
     );
     
@@ -813,32 +809,31 @@ eIcicleError vec_sum_cuda(
     const VecOpsConfig& config
 ) {
     cudaStream_t stream = static_cast<cudaStream_t>(config.stream);
-    const int threads = 256;
-    const int blocks = (size + 2 * threads - 1) / (2 * threads);
+    auto cfg = get_reduction_launch_config(size, GPUConfig::FR_SIZE);
     
     // Allocate partial sums
     Fr* d_partial;
-    cudaMalloc(&d_partial, blocks * sizeof(Fr));
+    cudaMalloc(&d_partial, cfg.blocks * sizeof(Fr));
     
     // First reduction
-    vec_ops::vec_sum_partial_kernel<<<blocks, threads, threads * sizeof(Fr), stream>>>(
+    vec_ops::vec_sum_partial_kernel<<<cfg.blocks, cfg.threads, cfg.threads * sizeof(Fr), stream>>>(
         d_partial, input, size
     );
     
     // Continue reduction until single value
-    int remaining = blocks;
+    int remaining = cfg.blocks;
     while (remaining > 1) {
-        int new_blocks = (remaining + 2 * threads - 1) / (2 * threads);
+        auto cfg_next = get_reduction_launch_config(remaining, GPUConfig::FR_SIZE);
         Fr* d_new_partial;
-        cudaMalloc(&d_new_partial, new_blocks * sizeof(Fr));
+        cudaMalloc(&d_new_partial, cfg_next.blocks * sizeof(Fr));
         
-        vec_ops::vec_sum_partial_kernel<<<new_blocks, threads, threads * sizeof(Fr), stream>>>(
+        vec_ops::vec_sum_partial_kernel<<<cfg_next.blocks, cfg_next.threads, cfg_next.threads * sizeof(Fr), stream>>>(
             d_new_partial, d_partial, remaining
         );
         
         cudaFree(d_partial);
         d_partial = d_new_partial;
-        remaining = new_blocks;
+        remaining = cfg_next.blocks;
     }
     
     // Copy result
@@ -871,10 +866,9 @@ eIcicleError vec_add_cuda(
     const VecOpsConfig& config
 ) {
     cudaStream_t stream = static_cast<cudaStream_t>(config.stream);
-    const int threads = 256;
-    const int blocks = (size + threads - 1) / threads;
+    auto cfg = get_launch_config(size, KernelType::VEC_ELEMENT_WISE);
     
-    vec_add_kernel<<<blocks, threads, 0, stream>>>(output, a, b, size);
+    vec_add_kernel<<<cfg.blocks, cfg.threads, 0, stream>>>(output, a, b, size);
     
     return cudaGetLastError() == cudaSuccess ? 
            eIcicleError::SUCCESS : eIcicleError::UNKNOWN_ERROR;
@@ -889,10 +883,9 @@ eIcicleError vec_sub_cuda(
     const VecOpsConfig& config
 ) {
     cudaStream_t stream = static_cast<cudaStream_t>(config.stream);
-    const int threads = 256;
-    const int blocks = (size + threads - 1) / threads;
+    auto cfg = get_launch_config(size, KernelType::VEC_ELEMENT_WISE);
     
-    vec_sub_kernel<<<blocks, threads, 0, stream>>>(output, a, b, size);
+    vec_sub_kernel<<<cfg.blocks, cfg.threads, 0, stream>>>(output, a, b, size);
     
     return cudaGetLastError() == cudaSuccess ? 
            eIcicleError::SUCCESS : eIcicleError::UNKNOWN_ERROR;
@@ -907,10 +900,9 @@ eIcicleError vec_mul_cuda(
     const VecOpsConfig& config
 ) {
     cudaStream_t stream = static_cast<cudaStream_t>(config.stream);
-    const int threads = 256;
-    const int blocks = (size + threads - 1) / threads;
+    auto cfg = get_launch_config(size, KernelType::VEC_ELEMENT_WISE);
     
-    vec_mul_kernel<<<blocks, threads, 0, stream>>>(output, a, b, size);
+    vec_mul_kernel<<<cfg.blocks, cfg.threads, 0, stream>>>(output, a, b, size);
     
     return cudaGetLastError() == cudaSuccess ? 
            eIcicleError::SUCCESS : eIcicleError::UNKNOWN_ERROR;
@@ -951,25 +943,22 @@ eIcicleError batch_inv_cuda(
     // For small sizes, use simple element-wise inversion
     // (overhead of Montgomery's trick not worth it below ~16 elements)
     if (size < 16) {
-        const int threads = 256;
-        const int blocks = (size + threads - 1) / threads;
-        vec_inv_kernel<<<blocks, threads, 0, stream>>>(output, input, size);
+        auto cfg = get_launch_config(size, KernelType::COMPUTE_BOUND);
+        vec_inv_kernel<<<cfg.blocks, cfg.threads, 0, stream>>>(output, input, size);
         return cudaGetLastError() == cudaSuccess ? 
                eIcicleError::SUCCESS : eIcicleError::UNKNOWN_ERROR;
     }
     
     // Allocate scratch space
     F *d_prefix, *d_block_products, *d_block_prefix_inv;
-    const int threads = 256;
-    const int blocks = (size + threads - 1) / threads;
+    auto cfg = get_launch_config(size, KernelType::COMPUTE_BOUND);
     
     // Check if we exceed single-block limit for Phase 2
-    if (blocks > 1024) {
+    if (cfg.blocks > 1024) {
         // For very large arrays (>262K elements), fall back to simple element-wise inversion
         // A full recursive implementation would require Phase 2 to be multi-level
-        const int inv_threads = 256;
-        const int inv_blocks = (size + inv_threads - 1) / inv_threads;
-        vec_inv_kernel<<<inv_blocks, inv_threads, 0, stream>>>(output, input, size);
+        auto cfg_inv = get_launch_config(size, KernelType::COMPUTE_BOUND);
+        vec_inv_kernel<<<cfg_inv.blocks, cfg_inv.threads, 0, stream>>>(output, input, size);
         return cudaGetLastError() == cudaSuccess ? eIcicleError::SUCCESS : eIcicleError::UNKNOWN_ERROR;
     }
     
@@ -977,25 +966,25 @@ eIcicleError batch_inv_cuda(
     err = cudaMalloc(&d_prefix, size * sizeof(F));
     if (err != cudaSuccess) return eIcicleError::ALLOCATION_FAILED;
     
-    err = cudaMalloc(&d_block_products, blocks * sizeof(F));
+    err = cudaMalloc(&d_block_products, cfg.blocks * sizeof(F));
     if (err != cudaSuccess) { cudaFree(d_prefix); return eIcicleError::ALLOCATION_FAILED; }
     
-    err = cudaMalloc(&d_block_prefix_inv, blocks * sizeof(F));
+    err = cudaMalloc(&d_block_prefix_inv, cfg.blocks * sizeof(F));
     if (err != cudaSuccess) { cudaFree(d_prefix); cudaFree(d_block_products); return eIcicleError::ALLOCATION_FAILED; }
     
     // Phase 1: Block-level prefix products
-    batch_inv_prefix_phase1_kernel<<<blocks, threads, threads * sizeof(F), stream>>>(
+    batch_inv_prefix_phase1_kernel<<<cfg.blocks, cfg.threads, cfg.threads * sizeof(F), stream>>>(
         d_prefix, d_block_products, input, size
     );
     
     // Phase 2: Block product prefix inverses (single block)
-    // Shared mem: blocks elements + 1 for total_inv
-    batch_inv_block_prefix_kernel<<<1, blocks, (blocks + 1) * sizeof(F), stream>>>(
-        d_block_prefix_inv, d_block_products, blocks
+    // Shared mem: cfg.blocks elements + 1 for total_inv
+    batch_inv_block_prefix_kernel<<<1, cfg.blocks, (cfg.blocks + 1) * sizeof(F), stream>>>(
+        d_block_prefix_inv, d_block_products, cfg.blocks
     );
     
     // Phase 3: Final computation
-    batch_inv_compute_phase3_kernel<<<blocks, threads, threads * sizeof(F), stream>>>(
+    batch_inv_compute_phase3_kernel<<<cfg.blocks, cfg.threads, cfg.threads * sizeof(F), stream>>>(
         output, input, d_prefix, d_block_prefix_inv, size
     );
     
@@ -1058,9 +1047,8 @@ eIcicleError bls12_381_vector_add(
         cudaMalloc(&d_output, size * sizeof(Fr));
     }
     
-    const int threads = 256;
-    const int blocks = (size + threads - 1) / threads;
-    vec_ops::vec_add_kernel<<<blocks, threads, 0, stream>>>(d_output, d_a, d_b, (int)size);
+    auto cfg = get_launch_config((int)size, KernelType::VEC_ELEMENT_WISE);
+    vec_ops::vec_add_kernel<<<cfg.blocks, cfg.threads, 0, stream>>>(d_output, d_a, d_b, (int)size);
     cudaStreamSynchronize(stream);
     
     if (need_alloc_output) {
@@ -1108,9 +1096,8 @@ eIcicleError bls12_381_vector_sub(
         cudaMalloc(&d_output, size * sizeof(Fr));
     }
     
-    const int threads = 256;
-    const int blocks = (size + threads - 1) / threads;
-    vec_ops::vec_sub_kernel<<<blocks, threads, 0, stream>>>(d_output, d_a, d_b, (int)size);
+    auto cfg = get_launch_config((int)size, KernelType::VEC_ELEMENT_WISE);
+    vec_ops::vec_sub_kernel<<<cfg.blocks, cfg.threads, 0, stream>>>(d_output, d_a, d_b, (int)size);
     cudaStreamSynchronize(stream);
     
     if (need_alloc_output) {
@@ -1158,9 +1145,8 @@ eIcicleError bls12_381_vector_mul(
         cudaMalloc(&d_output, size * sizeof(Fr));
     }
     
-    const int threads = 256;
-    const int blocks = (size + threads - 1) / threads;
-    vec_ops::vec_mul_kernel<<<blocks, threads, 0, stream>>>(d_output, d_a, d_b, (int)size);
+    auto cfg = get_launch_config((int)size, KernelType::VEC_ELEMENT_WISE);
+    vec_ops::vec_mul_kernel<<<cfg.blocks, cfg.threads, 0, stream>>>(d_output, d_a, d_b, (int)size);
     cudaStreamSynchronize(stream);
     
     if (need_alloc_output) {

@@ -47,12 +47,14 @@
 
 #include "field.cuh"
 #include "icicle_types.cuh"
+#include "gpu_config.cuh"
 #include <cuda_runtime.h>
 #include <mutex>
 
 namespace ntt {
 
 using namespace bls12_381;
+using namespace gpu;
 
 // Maximum log domain size supported
 constexpr int MAX_LOG_DOMAIN_SIZE = 33;
