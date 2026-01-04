@@ -40,7 +40,6 @@ make -j$(nproc)
 | `BUILD_TESTS` | ON | Build test executables |
 | `G2_ENABLED` | ON | Enable G2 curve support |
 | `MULTI_GPU_ARCH` | ON | Build for multiple GPU architectures |
-| `ECNTT_ENABLED` | OFF | Enable EC-NTT (experimental) |
 | `GLV_ENABLED` | OFF | Enable GLV endomorphism (experimental) |
 
 ### Example: Development Build (Faster)
@@ -91,8 +90,7 @@ cuda-backend/
 │   │   └── vec_ops.cu          # Vector operations
 │   ├── curve/              # Curve implementations
 │   │   ├── msm_kernels.cu      # Multi-Scalar Multiplication
-│   │   ├── point_ops.cu        # Point arithmetic
-│   │   └── ecntt.cu            # EC-NTT (experimental)
+│   │   └── point_ops.cu        # Point arithmetic
 │   ├── device/             # Device management
 │   └── backend/            # ICICLE API integration
 ├── tests/                  # Test suite
