@@ -127,6 +127,7 @@ set(FIELD_SOURCES
 # Curve library sources (depends on field library)
 set(CURVE_SOURCES
     src/curve/point_ops.cu
+    src/curve/msm_kernels.cu
     src/backend/icicle_curve_api.cu
     src/backend/g2_registry.cu
 )

@@ -584,28 +584,6 @@ static icicle::eIcicleError msm_g2_precompute_bases_cuda_impl(
 }
 
 // =============================================================================
-// Template Instantiations
-// =============================================================================
-
-// Explicit template instantiation for G1
-template cudaError_t msm::msm_cuda<Fr, G1Affine, G1Projective>(
-    const Fr* scalars,
-    const G1Affine* bases,
-    int msm_size,
-    const icicle::MSMConfig& config,
-    G1Projective* result
-);
-
-// Explicit template instantiation for G2
-template cudaError_t msm::msm_cuda<Fr, G2Affine, G2Projective>(
-    const Fr* scalars,
-    const G2Affine* bases,
-    int msm_size,
-    const icicle::MSMConfig& config,
-    G2Projective* result
-);
-
-// =============================================================================
 // ICICLE Backend Registration (must be at file scope for static initialization)
 // =============================================================================
 

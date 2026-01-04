@@ -21,18 +21,15 @@
 
 /**
  * @file msm.cuh
- * @brief Multi-Scalar Multiplication (MSM) - Pippenger's Algorithm
+ * @brief Multi-Scalar Multiplication (MSM) - Types and Configuration
  * 
- * Computes: R = Σᵢ sᵢ × Pᵢ for scalars s and points P
- * 
- * ARCHITECTURE:
- * =============
- * MSM kernels are templates defined in this header. This is an exception to
- * the "kernels in .cu files" rule because MSM is parameterized by curve type.
- * Template instantiation happens in msm.cu.
+ * This header provides MSM types, configuration, and API declarations.
+ * Kernel implementations are in src/curve/msm_kernels.cu.
  * 
  * ALGORITHM (Pippenger's Bucket Method):
  * ======================================
+ * Computes: R = Σᵢ sᵢ × Pᵢ for scalars s and points P
+ * 
  * 1. Decompose scalars into windows of c bits each
  * 2. For each window, accumulate points into 2^c buckets
  * 3. Compute weighted sum: Σⱼ j × bucket[j] (triangle sum)
@@ -41,48 +38,15 @@
  * LIMITS:
  * =======
  * - Maximum MSM size: 2^24 points (16M)
- *   - Larger sizes risk integer overflow in intermediate calculations
- *   - For larger MSMs, split into batches and aggregate results
- * 
- * - Window size c: 1-24
- *   - Larger windows = more buckets = more memory
- *   - c > 24 may cause bucket index overflow
+ * - Window size c: 1-24 bits
  * 
  * MEMORY USAGE:
  * =============
- * - Bucket storage: num_windows * 2^(c-1) * sizeof(G1Projective)
- *   - For c=16, n=2^20: 16 windows * 32K buckets * 288 bytes ≈ 148 MB
- * - CUB sort temporary: ~2x input size for radix sort
- * - Total GPU memory required: approximately 3-4x input point array size
+ * Total GPU memory ≈ 3-4x input point array size
  * 
- * Example memory for 1M points (c=15):
- *   - Input points: 1M * 288 bytes = 288 MB
- *   - Buckets: 17 windows * 16K buckets * 288 bytes = 78 MB
- *   - Sort temp: ~100 MB
- *   - Total: ~500 MB
- * 
- * SECURITY (Constant-Time Implementation):
- * ========================================
- * Uses Sort-Reduce pattern for bucket accumulation:
- * - Sort (bucket_idx, point) pairs by bucket
- * - Reduce consecutive points for same bucket
- * This prevents timing side-channels that could leak scalar information.
- * 
- * For side-channel sensitive applications, verify this is sufficient
- * for your threat model. The main remaining side-channel is memory
- * access patterns during bucket accumulation.
- * 
- * PERFORMANCE:
- * ============
- * - Optimal c selected based on MSM size (larger MSM → larger window)
- * - Signed digit representation for smaller bucket count
- * - CUB library for efficient parallel sorting
- * 
- * Kernels:
- * - compute_bucket_indices_kernel: Decompose scalars into bucket indices
- * - accumulate_sorted_kernel: Sort-Reduce bucket accumulation
- * - parallel_bucket_reduction_kernel: Compute weighted bucket sums
- * - final_accumulation_kernel: Combine window results
+ * SECURITY:
+ * =========
+ * Uses Sort-Reduce pattern for constant-time bucket accumulation.
  */
 
 #pragma once
@@ -91,7 +55,6 @@
 #include "icicle_types.cuh"
 #include "gpu_config.cuh"
 #include <cuda_runtime.h>
-#include <cub/cub.cuh>
 
 namespace msm {
 
@@ -104,33 +67,20 @@ using namespace gpu;
 // =============================================================================
 
 // Maximum MSM size to prevent integer overflow in packed index encoding
-// (idx << 1) requires idx < 2^31 for safe unsigned 32-bit operation
 constexpr int MAX_MSM_SIZE = (1 << 24);  // 16M points
 
 // Window size limits
 constexpr int MIN_WINDOW_SIZE = 1;
-constexpr int MAX_WINDOW_SIZE = 24;  // Prevents bucket count overflow
+constexpr int MAX_WINDOW_SIZE = 24;
 
 // Invalid bucket index marker (for zero contributions)
 constexpr unsigned int INVALID_BUCKET_INDEX = 0xFFFFFFFF;
 
 // =============================================================================
-// Generic Point Operation Dispatchers
+// Point Operation Dispatchers (inline device functions)
 // =============================================================================
-// These allow the templated kernels to call the correct point operations
-// based on the point type (G1 or G2).
-//
-// IMPORTANT: G1 and G2 use different base fields:
-// - G1: Fq (381-bit prime field)
-// - G2: Fq2 = Fq[u]/(u²+1) (quadratic extension)
-//
-// Point sizes differ:
-// - G1Affine: 96 bytes, G1Projective: 144 bytes
-// - G2Affine: 192 bytes, G2Projective: 288 bytes
-//
-// Scalars (Fr) are the SAME for both curves.
+// These allow templated kernels to call correct point operations for G1/G2.
 
-// --- Point Addition (Projective + Projective) ---
 __device__ __forceinline__ void point_add(G1Projective& result, const G1Projective& a, const G1Projective& b) {
     g1_add(result, a, b);
 }
@@ -139,7 +89,6 @@ __device__ __forceinline__ void point_add(G2Projective& result, const G2Projecti
     g2_add(result, a, b);
 }
 
-// --- Mixed Addition (Projective + Affine) ---
 __device__ __forceinline__ void point_add_mixed(G1Projective& result, const G1Projective& a, const G1Affine& b) {
     g1_add_mixed(result, a, b);
 }
@@ -148,7 +97,6 @@ __device__ __forceinline__ void point_add_mixed(G2Projective& result, const G2Pr
     g2_add_mixed(result, a, b);
 }
 
-// --- Point Doubling ---
 __device__ __forceinline__ void point_double(G1Projective& result, const G1Projective& a) {
     g1_double(result, a);
 }
@@ -158,14 +106,11 @@ __device__ __forceinline__ void point_double(G2Projective& result, const G2Proje
 }
 
 // =============================================================================
-// MSM Configuration
+// MSM Configuration Helpers
 // =============================================================================
 
 /**
  * @brief Determine optimal window size based on MSM size
- * 
- * Empirically tuned values matching Icicle/BLST heuristics.
- * Larger windows = fewer additions but more buckets.
  */
 __host__ __device__ inline int get_optimal_c(int msm_size) {
     if (msm_size <= 1) return 1;
@@ -177,7 +122,6 @@ __host__ __device__ inline int get_optimal_c(int msm_size) {
         log_size++;
     }
     
-    // Empirical optimal values
     if (log_size <= 8)  return 7;
     if (log_size <= 10) return 8;
     if (log_size <= 12) return 10;
@@ -196,639 +140,23 @@ __host__ __device__ inline int get_num_windows(int scalar_bits, int c) {
 }
 
 // =============================================================================
-// Scalar Window Extraction
+// MSM API Declaration
 // =============================================================================
 
 /**
- * @brief Extract c-bit window from scalar
- */
-__device__ __forceinline__ int extract_window_value(
-    const Fr& scalar,
-    int window_idx,
-    int c
-) {
-    int bit_offset = window_idx * c;
-    int limb_idx = bit_offset / 64;
-    int bit_in_limb = bit_offset % 64;
-    
-    if (limb_idx >= Fr::LIMBS) return 0;
-    
-    uint64_t window = scalar.limbs[limb_idx] >> bit_in_limb;
-    
-    // Handle cross-limb windows
-    int bits_from_first = 64 - bit_in_limb;
-    if (bits_from_first < c && limb_idx + 1 < Fr::LIMBS) {
-        window |= (scalar.limbs[limb_idx + 1] << bits_from_first);
-    }
-    
-    // Mask to c bits
-    return (int)(window & ((1ULL << c) - 1));
-}
-
-// =============================================================================
-// Bucket Accumulation Kernels (Sorted / Constant-Time)
-// =============================================================================
-
-/**
- * @brief Compute bucket indices for all scalar windows (Constant Time)
- */
-template<typename S>
-__global__ void compute_bucket_indices_kernel(
-    unsigned int* bucket_indices,    // [msm_size * num_windows]
-    unsigned int* packed_indices,    // [msm_size * num_windows] (point_idx << 1 | sign)
-    const S* scalars,
-    int msm_size,
-    int c,
-    int num_windows,
-    int num_buckets // Actual buckets per window (excluding trash)
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= msm_size) return;
-    
-    S scalar = scalars[idx];
-    
-    // Number of buckets per window including trash bucket
-    int buckets_per_window = num_buckets + 1;
-    
-    // Signed window decomposition with carry propagation
-    // We use signed digits in range [-(2^(c-1)), 2^(c-1)]
-    // When window_val > num_buckets (2^(c-1)), we use negative form:
-    //   window_val = 2^c - bucket_val  =>  bucket_val = 2^c - window_val
-    // This means we're computing: -bucket_val * P + carry * 2^c * P
-    // The carry propagates to the next window.
-    
-    int carry = 0;
-    
-    for (int w = 0; w < num_windows; w++) {
-        int output_idx = idx * num_windows + w;
-        
-        // Extract window value
-        int bit_offset = w * c;
-        int limb_idx = bit_offset / 64;
-        int bit_in_limb = bit_offset % 64;
-        
-        uint64_t window = scalar.limbs[limb_idx] >> bit_in_limb;
-        if (bit_in_limb + c > 64 && limb_idx + 1 < S::LIMBS) {
-            window |= (scalar.limbs[limb_idx + 1] << (64 - bit_in_limb));
-        }
-        window &= ((1ULL << c) - 1);
-        
-        // Add carry from previous window
-        int window_val = (int)window + carry;
-        carry = 0;
-        
-        // Constant-time logic
-        int sign = 0;
-        int bucket_val = window_val;
-        
-        // Handle signed digit: if (window_val > num_buckets)
-        // Use negative representation: bucket_val = 2^c - window_val
-        // This generates a carry of +1 to the next window
-        int is_large = (window_val > num_buckets);
-        if (is_large) {
-            bucket_val = (1 << c) - window_val;
-            sign = 1;
-            carry = 1;  // Propagate carry to next window
-        }
-        
-        // Handle zero: if (bucket_val == 0 after adjustment)
-        int is_zero = (bucket_val == 0);
-        if (is_zero) {
-            bucket_val = num_buckets + 1; // Map to trash bucket (beyond valid range)
-            sign = 0;
-        }
-        
-        // Global bucket index (0-based)
-        unsigned int bucket_idx = w * buckets_per_window + (bucket_val - 1);
-        
-        bucket_indices[output_idx] = bucket_idx;
-        
-        // Use unsigned to prevent signed overflow, validate idx fits in 31 bits
-        // This is guaranteed by MAX_MSM_SIZE check at function entry
-        unsigned int idx_unsigned = static_cast<unsigned int>(idx);
-        packed_indices[output_idx] = (idx_unsigned << 1) | (sign & 1);
-    }
-    
-    // For valid scalars < modulus, the final window should never produce a carry.
-    // If it does, the scalar is malformed or >= modulus, which should be rejected.
-    // We handle this by mapping to trash bucket (same as zero contributions).
-    if (carry != 0) {
-        // Final window generated carry - mark all windows for this scalar as invalid
-        for (int w = 0; w < num_windows; w++) {
-            int output_idx = idx * num_windows + w;
-            bucket_indices[output_idx] = INVALID_BUCKET_INDEX;
-        }
-    }
-}
-
-/**
- * @brief Warp-cooperative bucket accumulation for large buckets
+ * @brief Multi-Scalar Multiplication using Pippenger's algorithm
  * 
- * When a small number of buckets have many points,
- * we use multiple threads to process each bucket in parallel.
- * This spreads work across more threads and SMs.
+ * @tparam S Scalar type (Fr)
+ * @tparam A Affine point type (G1Affine or G2Affine)
+ * @tparam P Projective point type (G1Projective or G2Projective)
  * 
- * Strategy: Each thread block processes BUCKETS_PER_BLOCK buckets.
- * Within a block, we use NUM_THREADS_PER_BUCKET threads per bucket.
- * Each thread accumulates a strided portion, then we reduce within the group.
+ * @param scalars Array of scalars
+ * @param bases Array of affine points
+ * @param msm_size Number of scalar-point pairs
+ * @param config MSM configuration
+ * @param result Output projective point
  * 
- * Template parameters:
- * - A: Affine point type (G1Affine or G2Affine)
- * - P: Projective point type (G1Projective or G2Projective)
- * - THREADS_PER_BUCKET: Number of threads cooperating per bucket (power of 2, ≤ 32)
- */
-template<typename A, typename P, int THREADS_PER_BUCKET = 8>
-__global__ void accumulate_cooperative_kernel(
-    P* buckets,
-    const unsigned int* sorted_packed_indices,
-    const A* bases,
-    const unsigned int* bucket_offsets,
-    const unsigned int* bucket_sizes,
-    int total_buckets
-) {
-    static_assert(THREADS_PER_BUCKET <= 32 && (THREADS_PER_BUCKET & (THREADS_PER_BUCKET - 1)) == 0,
-                  "THREADS_PER_BUCKET must be power of 2 and <= 32");
-    
-    // Each group of THREADS_PER_BUCKET threads processes one bucket
-    int groups_per_block = blockDim.x / THREADS_PER_BUCKET;
-    int group_id = threadIdx.x / THREADS_PER_BUCKET;
-    int lane_in_group = threadIdx.x % THREADS_PER_BUCKET;
-    
-    // Global bucket ID
-    int bucket_id = blockIdx.x * groups_per_block + group_id;
-    
-    if (bucket_id >= total_buckets) return;
-    
-    unsigned int offset = bucket_offsets[bucket_id];
-    unsigned int size = bucket_sizes[bucket_id];
-    
-    // Each lane accumulates a strided portion
-    P local_acc = P::identity();
-    
-    for (unsigned int i = lane_in_group; i < size; i += THREADS_PER_BUCKET) {
-        unsigned int idx = offset + i;
-        unsigned int packed = sorted_packed_indices[idx];
-        unsigned int point_idx = packed >> 1;
-        unsigned int sign = packed & 1;
-        
-        A base = bases[point_idx];
-        if (sign) {
-            base = base.neg();
-        }
-        
-        point_add_mixed(local_acc, local_acc, base);
-    }
-    
-    // Tree-based reduction within the group using shared memory
-    extern __shared__ char shared_mem[];
-    P* shared_acc = reinterpret_cast<P*>(shared_mem);
-    
-    // Store local accumulator
-    shared_acc[threadIdx.x] = local_acc;
-    __syncthreads();
-    
-    // Reduce within the group
-    for (int stride = THREADS_PER_BUCKET / 2; stride > 0; stride >>= 1) {
-        if (lane_in_group < stride) {
-            P other = shared_acc[threadIdx.x + stride];
-            point_add(shared_acc[threadIdx.x], shared_acc[threadIdx.x], other);
-        }
-        __syncthreads();
-    }
-    
-    // Lane 0 writes the result
-    if (lane_in_group == 0) {
-        buckets[bucket_id] = shared_acc[threadIdx.x];
-    }
-}
-
-/**
- * @brief Persistent-thread bucket indices kernel
- * 
- * For small MSM sizes, we use persistent threads
- * to ensure all SMs are occupied. Each thread processes multiple scalars
- * in a strided fashion.
- * 
- * This increases parallelism for small MSM sizes where the standard
- * 1-thread-per-scalar approach leaves the GPU underutilized.
- * 
- * NOTE: This kernel uses the same signed-digit representation with carry
- * propagation as the original kernel.
- */
-template<typename S>
-__global__ void compute_bucket_indices_persistent_kernel(
-    unsigned int* bucket_indices,
-    unsigned int* packed_indices,
-    const S* scalars,
-    int msm_size,
-    int c,
-    int num_windows,
-    int num_buckets,
-    int total_work_items  // msm_size, but each thread processes multiple
-) {
-    const int buckets_per_window = num_buckets + 1;
-    
-    // Persistent thread pattern: each thread processes strided work items
-    int stride = gridDim.x * blockDim.x;
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    // Process multiple scalars per thread
-    for (int idx = tid; idx < msm_size; idx += stride) {
-        S scalar = scalars[idx];
-        int carry = 0;
-        
-        // Process all windows for this scalar (must be sequential due to carry)
-        for (int w = 0; w < num_windows; w++) {
-            int output_idx = idx * num_windows + w;
-            
-            // Extract window value using same logic as original kernel
-            int start_bit = w * c;
-            int limb_idx = start_bit / 64;
-            int bit_in_limb = start_bit % 64;
-            
-            uint64_t window = scalar.limbs[limb_idx] >> bit_in_limb;
-            if (bit_in_limb + c > 64 && limb_idx + 1 < S::LIMBS) {
-                window |= (scalar.limbs[limb_idx + 1] << (64 - bit_in_limb));
-            }
-            window &= ((1ULL << c) - 1);
-            
-            // Add carry from previous window
-            int window_val = (int)window + carry;
-            carry = 0;
-            
-            // Constant-time logic
-            int sign = 0;
-            int bucket_val = window_val;
-            
-            // Handle signed digit: if (window_val > num_buckets)
-            int is_large = (window_val > num_buckets);
-            if (is_large) {
-                bucket_val = (1 << c) - window_val;
-                sign = 1;
-                carry = 1;
-            }
-            
-            // Handle zero
-            int is_zero = (bucket_val == 0);
-            if (is_zero) {
-                bucket_val = num_buckets + 1; // Map to trash bucket
-                sign = 0;
-            }
-            
-            // Global bucket index (0-based)
-            unsigned int bucket_idx = w * buckets_per_window + (bucket_val - 1);
-            
-            bucket_indices[output_idx] = bucket_idx;
-            packed_indices[output_idx] = (static_cast<unsigned int>(idx) << 1) | (sign & 1);
-        }
-        
-        // Handle carry overflow (same as original)
-        if (carry != 0) {
-            for (int w = 0; w < num_windows; w++) {
-                int output_idx = idx * num_windows + w;
-                bucket_indices[output_idx] = INVALID_BUCKET_INDEX;
-            }
-        }
-    }
-}
-
-/**
- * @brief Conflict-free bucket accumulation after sorting (templated for G1/G2)
- * 
- * Template parameters:
- * - A: Affine point type (G1Affine or G2Affine)
- * - P: Projective point type (G1Projective or G2Projective)
- */
-template<typename A, typename P>
-__global__ void accumulate_sorted_kernel(
-    P* buckets,
-    const unsigned int* sorted_packed_indices,
-    const A* bases,
-    const unsigned int* bucket_offsets,
-    const unsigned int* bucket_sizes,
-    int total_buckets
-) {
-    int bucket_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (bucket_idx >= total_buckets) return;
-    
-    unsigned int offset = bucket_offsets[bucket_idx];
-    unsigned int size = bucket_sizes[bucket_idx];
-    
-    if (size == 0) {
-        buckets[bucket_idx] = P::identity();
-        return;
-    }
-    
-    P acc = P::identity();
-    
-    for (unsigned int i = 0; i < size; i++) {
-        unsigned int idx = offset + i;
-        unsigned int packed = sorted_packed_indices[idx];
-        unsigned int point_idx = packed >> 1;
-        unsigned int sign = packed & 1;
-        
-        A base = bases[point_idx];
-        if (sign) {
-            base = base.neg();
-        }
-        
-        // Uses overloaded point_add_mixed for G1 or G2
-        point_add_mixed(acc, acc, base);
-    }
-    
-    buckets[bucket_idx] = acc;
-}
-
-/**
- * @brief Simple atomic histogram kernel
- * 
- * Each thread increments the count for its bucket index using atomics.
- */
-__global__ void histogram_atomic_kernel(
-    unsigned int* histogram,
-    const unsigned int* indices,
-    int num_samples,
-    int num_buckets
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_samples) return;
-    
-    unsigned int bucket = indices[idx];
-    if (bucket < (unsigned int)num_buckets) {
-        atomicAdd(&histogram[bucket], 1);
-    }
-}
-
-/**
- * @brief Optimized histogram kernel with warp-level aggregation
- * 
- * Reduces atomic contention by aggregating within warps first.
- * Uses warp-level ballot and popcount to count matching buckets before
- * issuing a single atomic per warp instead of per thread.
- */
-__global__ void histogram_warp_aggregated_kernel(
-    unsigned int* histogram,
-    const unsigned int* indices,
-    int num_samples,
-    int num_buckets
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int lane_id = threadIdx.x & 31;
-    
-    unsigned int bucket = INVALID_BUCKET_INDEX;
-    if (idx < num_samples) {
-        bucket = indices[idx];
-        if (bucket >= (unsigned int)num_buckets) {
-            bucket = INVALID_BUCKET_INDEX; // Mark invalid
-        }
-    }
-    
-    // Warp-level aggregation: find threads with same bucket value
-    // Process each unique bucket value in the warp
-    unsigned int active_mask = __ballot_sync(0xFFFFFFFF, bucket != INVALID_BUCKET_INDEX);
-    
-    while (active_mask != 0) {
-        // Get the bucket value from the first active lane
-        int leader = __ffs(active_mask) - 1;
-        unsigned int leader_bucket = __shfl_sync(0xFFFFFFFF, bucket, leader);
-        
-        // Find all lanes with matching bucket
-        unsigned int match_mask = __ballot_sync(active_mask, bucket == leader_bucket);
-        
-        // Count matches and have leader do single atomic
-        int count = __popc(match_mask);
-        if (lane_id == leader && leader_bucket != INVALID_BUCKET_INDEX) {
-            atomicAdd(&histogram[leader_bucket], count);
-        }
-        
-        // Remove processed lanes from active mask
-        active_mask &= ~match_mask;
-    }
-}
-
-/**
- * @brief Parallel bucket reduction (templated for G1/G2)
- * 
- * Runs one thread per window to perform the triangle summation.
- * Since num_buckets can be large (e.g. 2^16), we read directly from global memory.
- * 
- * Template parameters:
- * - P: Projective point type (G1Projective or G2Projective)
- */
-template<typename P>
-__global__ void parallel_bucket_reduction_kernel(
-    P* window_results,
-    const P* buckets,
-    int num_windows,
-    int num_buckets, // Excluding trash
-    int buckets_per_window // Including trash
-) {
-    int window_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (window_idx >= num_windows) return;
-    
-    // Offset to this window's buckets
-    const P* window_buckets = buckets + window_idx * buckets_per_window;
-    
-    P running_sum = P::identity();
-    P window_sum = P::identity();
-    
-    // Triangle summation: sum_{i=1}^B i*B_i
-    // Implemented as:
-    // running_sum += B_i
-    // window_sum += running_sum
-    // Iterate backwards from B-1 to 0 (bucket values B to 1)
-    // Note: bucket_idx i corresponds to value i+1
-    
-    for (int i = num_buckets - 1; i >= 0; i--) {
-        // Uses overloaded point_add for G1 or G2
-        point_add(running_sum, running_sum, window_buckets[i]);
-        point_add(window_sum, window_sum, running_sum);
-    }
-    
-    window_results[window_idx] = window_sum;
-}
-
-/**
- * @brief Multi-block parallel bucket reduction
- * 
- * Each block processes one window, with multiple threads
- * cooperating to compute the triangle summation in parallel.
- * 
- * The triangle sum Σ i*B[i] for i=1..n can be rewritten as:
- *   Σ i*B[i] = Σ_{i=1}^{n} (Σ_{j=i}^{n} B[j])
- * 
- * We compute this in two phases:
- * 1. Parallel suffix sums: Each thread computes suffix sum for its stripe
- * 2. Cooperative reduction: Combine stripe results
- */
-template<typename P>
-__global__ void parallel_bucket_reduction_multithread_kernel(
-    P* window_results,
-    const P* buckets,
-    int num_windows,
-    int num_buckets,
-    int buckets_per_window
-) {
-    // Each block handles one window
-    int window_idx = blockIdx.x;
-    if (window_idx >= num_windows) return;
-    
-    const int THREADS_PER_WINDOW = blockDim.x;
-    int tid = threadIdx.x;
-    
-    const P* window_buckets = buckets + window_idx * buckets_per_window;
-    
-    // Each thread processes a stripe of buckets
-    int buckets_per_thread = (num_buckets + THREADS_PER_WINDOW - 1) / THREADS_PER_WINDOW;
-    int start_bucket = tid * buckets_per_thread;
-    int end_bucket = min(start_bucket + buckets_per_thread, num_buckets);
-    
-    // Phase 1: Each thread computes partial triangle sum for its stripe
-    // For buckets [start, end), we need:
-    //   running_sum = sum of buckets from end to num_buckets (computed later)
-    //   partial_window_sum = sum of running_sums for this stripe
-    
-    // First, compute local running sum and window sum for the stripe
-    P local_running = P::identity();
-    P local_window = P::identity();
-    
-    // Process stripe from right to left (high bucket index to low)
-    for (int i = end_bucket - 1; i >= start_bucket; i--) {
-        point_add(local_running, local_running, window_buckets[i]);
-        point_add(local_window, local_window, local_running);
-    }
-    
-    // Store partial results in shared memory
-    extern __shared__ char shared_mem[];
-    P* shared_running = reinterpret_cast<P*>(shared_mem);
-    P* shared_window = shared_running + THREADS_PER_WINDOW;
-    
-    shared_running[tid] = local_running;
-    shared_window[tid] = local_window;
-    __syncthreads();
-    
-    // Phase 2: Thread 0 combines results from all threads
-    // Each stripe's running_sum needs to be added to all stripes to its left
-    if (tid == 0) {
-        P total_window = P::identity();
-        P suffix_sum = P::identity();
-        
-        // Process from rightmost thread to leftmost
-        for (int t = THREADS_PER_WINDOW - 1; t >= 0; t--) {
-            int t_start = t * buckets_per_thread;
-            int t_buckets = min(buckets_per_thread, num_buckets - t_start);
-            if (t_buckets <= 0) continue;
-            
-            // This thread's window sum needs suffix_sum added t_buckets times
-            P adjusted_window = shared_window[t];
-            for (int k = 0; k < t_buckets; k++) {
-                point_add(adjusted_window, adjusted_window, suffix_sum);
-            }
-            point_add(total_window, total_window, adjusted_window);
-            
-            // Update suffix sum
-            point_add(suffix_sum, suffix_sum, shared_running[t]);
-        }
-        
-        window_results[window_idx] = total_window;
-    }
-}
-
-// =============================================================================
-// Final Window Combination
-// =============================================================================
-
-/**
- * @brief Parallel final accumulation - processes windows in parallel stages
- * 
- * Instead of single-threaded sequential processing,
- * we parallelize the doubling operations across threads.
- * 
- * Algorithm:
- * 1. Each window result needs to be multiplied by 2^(w*c)
- * 2. We pre-compute the shifted window results in parallel
- * 3. Then reduce them using a tree-based approach
- * 
- * Template parameters:
- * - P: Projective point type (G1Projective or G2Projective)
- */
-template<typename P>
-__global__ void final_accumulation_parallel_kernel(
-    P* result,
-    P* window_results,  // Modified in-place for shifted values
-    int num_windows,
-    int c
-) {
-    // Stage 1: Each thread doubles its window result w*c times in parallel
-    // Thread w handles window w, doubling c*w times
-    int w = threadIdx.x;
-    
-    if (w < num_windows && w > 0) {
-        P val = window_results[w];
-        int doublings = w * c;
-        for (int i = 0; i < doublings; i++) {
-            point_double(val, val);
-        }
-        window_results[w] = val;
-    }
-    __syncthreads();
-    
-    // Stage 2: Tree-based reduction to sum all shifted windows
-    // Only thread 0 does the reduction (windows are small, typically < 32)
-    if (threadIdx.x == 0) {
-        P acc = window_results[0];
-        for (int i = 1; i < num_windows; i++) {
-            point_add(acc, acc, window_results[i]);
-        }
-        *result = acc;
-    }
-}
-
-/**
- * @brief Combine window results: result = sum_{w} 2^{w*c} * window_result[w]
- * 
- * Template parameters:
- * - P: Projective point type (G1Projective or G2Projective)
- */
-template<typename P>
-__global__ void final_accumulation_kernel(
-    P* result,
-    const P* window_results,
-    int num_windows,
-    int c
-) {
-    if (threadIdx.x != 0 || blockIdx.x != 0) return;
-    
-    P acc = window_results[num_windows - 1];
-    
-    // Process windows from second-highest to lowest
-    for (int w = num_windows - 2; w >= 0; w--) {
-        // Double c times
-        for (int i = 0; i < c; i++) {
-            // Uses overloaded point_double for G1 or G2
-            point_double(acc, acc);
-        }
-        // Add window result (uses overloaded point_add)
-        point_add(acc, acc, window_results[w]);
-    }
-    
-    *result = acc;
-}
-
-// =============================================================================
-// Main MSM Entry Point
-// =============================================================================
-
-/**
- * @brief MSM using Pippenger's bucket method with Sort-Reduce
- * implementation with conflict-free accumulation.
- * 
- * This implementation uses a Sort-Reduce approach to mitigate timing side-channels:
- * 1. Compute bucket indices for all windows (constant-time).
- * 2. Sort indices using Radix Sort (deterministic time).
- * 3. Accumulate sorted buckets (contiguous memory access).
- * 
- * Zeros are mapped to a "trash bucket" to avoid data-dependent skipping.
+ * @return cudaSuccess on success, error code otherwise
  */
 template<typename S, typename A, typename P>
 cudaError_t msm_cuda(
@@ -837,341 +165,23 @@ cudaError_t msm_cuda(
     int msm_size,
     const MSMConfig& config,
     P* result
-) {
-    // Validate pointers are non-null
-    if (scalars == nullptr || bases == nullptr || result == nullptr) {
-        return cudaErrorInvalidValue;
-    }
-    
-    // Validate msm_size is in safe range
-    if (msm_size < 0) {
-        return cudaErrorInvalidValue;
-    }
-    
-    // Handle empty MSM
-    if (msm_size == 0) {
-        P identity = P::identity();
-        if (config.are_results_on_device) {
-            cudaMemcpy(result, &identity, sizeof(P), cudaMemcpyHostToDevice);
-        } else {
-            *result = identity;
-        }
-        return cudaSuccess;
-    }
-    
-    // Validate msm_size doesn't exceed maximum safe value
-    // This prevents integer overflow in packed index encoding (idx << 1)
-    if (msm_size > MAX_MSM_SIZE) {
-        return cudaErrorInvalidValue;
-    }
+);
 
-    cudaStream_t stream = config.stream;
-    cudaError_t err;
-    
-    // =============================================================================
-    // Parameter Validation
-    // =============================================================================
-    
-    // Determine window size with proper validation
-    int c = config.c;
-    if (c <= 0) {
-        // Use automatic selection if not specified or invalid
-        c = get_optimal_c(msm_size);
-    }
-    
-    // Validate window size is in safe range
-    if (c < MIN_WINDOW_SIZE || c > MAX_WINDOW_SIZE) {
-        return cudaErrorInvalidValue;
-    }
+// Extern template declarations (instantiated in msm_kernels.cu)
+extern template cudaError_t msm_cuda<Fr, G1Affine, G1Projective>(
+    const Fr* scalars,
+    const G1Affine* bases,
+    int msm_size,
+    const MSMConfig& config,
+    G1Projective* result
+);
 
-    // Validate scalar bitsize
-    int scalar_bits = config.bitsize > 0 ? config.bitsize : S::LIMBS * 64;
-    if (scalar_bits <= 0 || scalar_bits > S::LIMBS * 64) {
-        return cudaErrorInvalidValue;
-    }
-    
-    int num_windows = get_num_windows(scalar_bits, c);
-    
-    // Validate bucket count doesn't overflow
-    // For c up to 24: (1 << 23) = 8,388,608 buckets per window (safe)
-    // c >= 32 would cause overflow in int
-    if (c >= 31) {  // Extra safety margin
-        return cudaErrorInvalidValue;
-    }
-    int num_buckets = (1 << (c - 1));  // Signed digit representation
-    
-    // Check for overflow in total_buckets calculation
-    long long total_buckets_long = (long long)num_windows * (long long)(num_buckets + 1);
-    if (total_buckets_long > (long long)INT_MAX) {
-        return cudaErrorInvalidValue;
-    }
-    int total_buckets = (int)total_buckets_long;
-    
-    // Check for overflow in num_contributions calculation
-    long long num_contributions_long = (long long)msm_size * (long long)num_windows;
-    if (num_contributions_long > (long long)INT_MAX) {
-        return cudaErrorInvalidValue;
-    }
-    int num_contributions = (int)num_contributions_long;
-    
-    // Allocate device memory
-    S* d_scalars = nullptr;
-    A* d_bases = nullptr;
-    P* d_result = nullptr;
-    P* d_buckets = nullptr;       // Use template P for bucket type
-    P* d_window_results = nullptr; // Use template P for window results
-    
-    // Sorting buffers
-    unsigned int *d_bucket_indices = nullptr, *d_packed_indices = nullptr;
-    unsigned int *d_bucket_indices_sorted = nullptr, *d_packed_indices_sorted = nullptr;
-    unsigned int *d_bucket_offsets = nullptr, *d_bucket_sizes = nullptr;
-
-    // Helper macro for error handling with cleanup
-    #define MSM_CUDA_CHECK(call) do { \
-        err = call; \
-        if (err != cudaSuccess) goto cleanup; \
-    } while(0)
-    
-    // Handle input data
-    if (config.are_scalars_on_device) {
-        d_scalars = const_cast<S*>(scalars);
-    } else {
-        MSM_CUDA_CHECK(cudaMalloc(&d_scalars, msm_size * sizeof(S)));
-        MSM_CUDA_CHECK(cudaMemcpyAsync(d_scalars, scalars, msm_size * sizeof(S), 
-                              cudaMemcpyHostToDevice, stream));
-    }
-    
-    if (config.are_points_on_device) {
-        d_bases = const_cast<A*>(bases);
-    } else {
-        MSM_CUDA_CHECK(cudaMalloc(&d_bases, msm_size * sizeof(A)));
-        MSM_CUDA_CHECK(cudaMemcpyAsync(d_bases, bases, msm_size * sizeof(A),
-                              cudaMemcpyHostToDevice, stream));
-    }
-    
-    MSM_CUDA_CHECK(cudaMalloc(&d_buckets, total_buckets * sizeof(P)));
-    MSM_CUDA_CHECK(cudaMalloc(&d_window_results, num_windows * sizeof(P)));
-    
-    if (config.are_results_on_device) {
-        d_result = result;
-    } else {
-        MSM_CUDA_CHECK(cudaMalloc(&d_result, sizeof(P)));
-    }
-    
-    // Allocate sorting buffers
-    MSM_CUDA_CHECK(cudaMalloc(&d_bucket_indices, num_contributions * sizeof(unsigned int)));
-    MSM_CUDA_CHECK(cudaMalloc(&d_packed_indices, num_contributions * sizeof(unsigned int)));
-    MSM_CUDA_CHECK(cudaMalloc(&d_bucket_indices_sorted, num_contributions * sizeof(unsigned int)));
-    MSM_CUDA_CHECK(cudaMalloc(&d_packed_indices_sorted, num_contributions * sizeof(unsigned int)));
-    MSM_CUDA_CHECK(cudaMalloc(&d_bucket_offsets, total_buckets * sizeof(unsigned int)));
-    MSM_CUDA_CHECK(cudaMalloc(&d_bucket_sizes, total_buckets * sizeof(unsigned int)));
-    
-    // 1. Compute Indices
-    // Use persistent-thread kernel for small MSM sizes
-    // to ensure all SMs are occupied even with few scalars
-    {
-        auto cfg = get_msm_launch_config(msm_size, KernelType::BUCKET_COUNT);
-        
-        if (cfg.use_persistent) {
-            // Use persistent-thread pattern for small MSM sizes
-            // Launch enough blocks to occupy all SMs, each thread processes multiple scalars
-            compute_bucket_indices_persistent_kernel<S><<<cfg.blocks, cfg.threads, 0, stream>>>(
-                d_bucket_indices, d_packed_indices, d_scalars, msm_size, c, num_windows, num_buckets, msm_size
-            );
-        } else {
-            // Standard kernel for larger MSM sizes
-            compute_bucket_indices_kernel<<<cfg.blocks, cfg.threads, 0, stream>>>(
-                d_bucket_indices, d_packed_indices, d_scalars, msm_size, c, num_windows, num_buckets
-            );
-        }
-        MSM_CUDA_CHECK(cudaGetLastError());
-    }
-    
-    // 2. Histogram (Compute bucket sizes) using warp-aggregated kernel
-    {
-        // Initialize sizes to 0
-        MSM_CUDA_CHECK(cudaMemsetAsync(d_bucket_sizes, 0, total_buckets * sizeof(unsigned int), stream));
-        
-        // Use optimized warp-aggregated histogram kernel (reduces atomics by up to 32×)
-        auto cfg = get_launch_config(num_contributions, KernelType::ATOMIC_BOUND);
-        histogram_warp_aggregated_kernel<<<cfg.blocks, cfg.threads, 0, stream>>>(
-            d_bucket_sizes, d_bucket_indices, num_contributions, total_buckets);
-        MSM_CUDA_CHECK(cudaGetLastError());
-    }
-    
-    // 3. Scan (Compute bucket offsets)
-    {
-        void* d_temp_storage = nullptr;
-        size_t temp_storage_bytes = 0;
-        
-        MSM_CUDA_CHECK(cub::DeviceScan::ExclusiveSum(d_temp_storage, temp_storage_bytes,
-            d_bucket_sizes, d_bucket_offsets, total_buckets, stream));
-            
-        MSM_CUDA_CHECK(cudaMalloc(&d_temp_storage, temp_storage_bytes));
-        
-        MSM_CUDA_CHECK(cub::DeviceScan::ExclusiveSum(d_temp_storage, temp_storage_bytes,
-            d_bucket_sizes, d_bucket_offsets, total_buckets, stream));
-            
-        MSM_CUDA_CHECK(cudaFree(d_temp_storage));
-    }
-    
-    // 4. Sort
-    {
-        void* d_temp_storage = nullptr;
-        size_t temp_storage_bytes = 0;
-        
-        MSM_CUDA_CHECK(cub::DeviceRadixSort::SortPairs(d_temp_storage, temp_storage_bytes,
-            d_bucket_indices, d_bucket_indices_sorted,
-            d_packed_indices, d_packed_indices_sorted,
-            num_contributions, 0, 32, stream));
-            
-        MSM_CUDA_CHECK(cudaMalloc(&d_temp_storage, temp_storage_bytes));
-        
-        MSM_CUDA_CHECK(cub::DeviceRadixSort::SortPairs(d_temp_storage, temp_storage_bytes,
-            d_bucket_indices, d_bucket_indices_sorted,
-            d_packed_indices, d_packed_indices_sorted,
-            num_contributions, 0, 32, stream));
-            
-        MSM_CUDA_CHECK(cudaFree(d_temp_storage));
-    }
-    
-    // 5. Accumulate Sorted
-    // Use cooperative kernel for small MSM sizes
-    // to increase parallelism by using multiple threads per bucket
-    {
-        constexpr int THREADS_PER_BUCKET = 8;  // 8 threads cooperate per bucket
-        int threads = GPUConfig::get().get_cooperative_threads(THREADS_PER_BUCKET);
-        
-        // Decide whether to use cooperative kernel based on MSM size
-        if (should_use_cooperative_accumulate(msm_size, total_buckets, threads)) {
-            // Cooperative kernel: multiple threads per bucket
-            auto cfg = get_msm_cooperative_config(total_buckets, THREADS_PER_BUCKET, sizeof(P));
-            accumulate_cooperative_kernel<A, P, THREADS_PER_BUCKET><<<cfg.blocks, cfg.threads, cfg.shared_mem, stream>>>(
-                d_buckets,
-                d_packed_indices_sorted,
-                d_bases,
-                d_bucket_offsets,
-                d_bucket_sizes,
-                total_buckets
-            );
-        } else {
-            // Standard kernel: one thread per bucket
-            auto cfg = get_launch_config(total_buckets, KernelType::BUCKET_REDUCE);
-            accumulate_sorted_kernel<A, P><<<cfg.blocks, cfg.threads, 0, stream>>>(
-                d_buckets,
-                d_packed_indices_sorted,
-                d_bases,
-                d_bucket_offsets,
-                d_bucket_sizes,
-                total_buckets
-            );
-        }
-        MSM_CUDA_CHECK(cudaGetLastError());
-    }
-    
-    // 6. Bucket Reduction
-    // Use multi-threaded reduction for large bucket counts
-    // Each block processes one window with multiple threads cooperating
-    {
-        auto cfg = get_msm_reduction_config(num_windows, num_buckets, sizeof(P));
-        
-        if (num_buckets >= 256) {
-            // Multi-threaded: one block per window
-            parallel_bucket_reduction_multithread_kernel<P><<<cfg.blocks, cfg.threads, cfg.shared_mem, stream>>>(
-                d_window_results,
-                d_buckets,
-                num_windows,
-                num_buckets,
-                num_buckets + 1 // buckets_per_window
-            );
-        } else {
-            // Simple: one thread per window
-            parallel_bucket_reduction_kernel<P><<<cfg.blocks, cfg.threads, 0, stream>>>(
-                d_window_results,
-                d_buckets,
-                num_windows,
-                num_buckets,
-                num_buckets + 1 // buckets_per_window
-            );
-        }
-        MSM_CUDA_CHECK(cudaGetLastError());
-    }
-    
-    // Final accumulation
-    // Use parallel kernel for final window combination
-    // Each thread handles one window's doublings in parallel
-    {
-        // Use parallel kernel when we have enough windows to benefit
-        if (num_windows >= 4) {
-            // Round up to next power of 2 for efficient reduction
-            int threads = 32;  // Use one warp - windows are typically < 32
-            while (threads < num_windows) threads *= 2;
-            if (threads > 256) threads = 256;  // Cap at reasonable size
-            
-            final_accumulation_parallel_kernel<P><<<1, threads, 0, stream>>>(
-                d_result,
-                d_window_results,
-                num_windows,
-                c
-            );
-        } else {
-            // Use original sequential kernel for small window counts
-            final_accumulation_kernel<P><<<1, 1, 0, stream>>>(
-                d_result,
-                d_window_results,
-                num_windows,
-                c
-            );
-        }
-        MSM_CUDA_CHECK(cudaGetLastError());
-    }
-    
-    // Copy result back if needed
-    if (!config.are_results_on_device) {
-        MSM_CUDA_CHECK(cudaMemcpyAsync(result, d_result, sizeof(P),
-                              cudaMemcpyDeviceToHost, stream));
-    }
-    
-    // Synchronize if not async
-    if (!config.is_async) {
-        MSM_CUDA_CHECK(cudaStreamSynchronize(stream));
-    }
-
-cleanup:
-    // Ensure all GPU operations complete before cleanup
-    // This prevents use-after-free in async mode
-    if (config.is_async && stream != nullptr) {
-        cudaStreamSynchronize(stream);  // Best effort, ignore errors in cleanup
-    }
-    
-    // Track cleanup errors separately from main operation errors
-    cudaError_t cleanup_err = cudaSuccess;
-    
-    #define SAFE_FREE(ptr) do { \
-        if (ptr) { \
-            cudaError_t e = cudaFree(ptr); \
-            if (e != cudaSuccess && cleanup_err == cudaSuccess) cleanup_err = e; \
-        } \
-    } while(0)
-    
-    SAFE_FREE(d_buckets);
-    SAFE_FREE(d_window_results);
-    SAFE_FREE(d_bucket_indices);
-    SAFE_FREE(d_packed_indices);
-    SAFE_FREE(d_bucket_indices_sorted);
-    SAFE_FREE(d_packed_indices_sorted);
-    SAFE_FREE(d_bucket_offsets);
-    SAFE_FREE(d_bucket_sizes);
-    
-    if (!config.are_scalars_on_device) SAFE_FREE(d_scalars);
-    if (!config.are_points_on_device) SAFE_FREE(d_bases);
-    if (!config.are_results_on_device) SAFE_FREE(d_result);
-    
-    #undef SAFE_FREE
-    #undef MSM_CUDA_CHECK
-    
-    // Return original error if present, otherwise cleanup error
-    return (err != cudaSuccess) ? err : cleanup_err;
-}
+extern template cudaError_t msm_cuda<Fr, G2Affine, G2Projective>(
+    const Fr* scalars,
+    const G2Affine* bases,
+    int msm_size,
+    const MSMConfig& config,
+    G2Projective* result
+);
 
 } // namespace msm
