@@ -86,7 +86,7 @@ cuda-backend/
 │   └── common/             # Shared utilities
 ├── src/
 │   ├── field/              # Field implementations
-│   │   ├── field_backend.cu    # Fr field arithmetic
+│   │   ├── ntt_kernels.cu      # NTT (Number Theoretic Transform)
 │   │   └── vec_ops.cu          # Vector operations
 │   ├── curve/              # Curve implementations
 │   │   ├── msm_kernels.cu      # Multi-Scalar Multiplication

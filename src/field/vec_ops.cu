@@ -290,9 +290,9 @@ __global__ void batch_inv_compute_kernel(
  * 3. Phase 3: Each block computes suffix inverses and final results
  * 
  * Inverts n elements using 3(n-1) multiplications + 1 inversion
- * instead of n inversions (each ~256 multiplications).
+ * instead of n inversions (each ~300 operations for BLS12-381).
  * 
- * Speedup: ~85x for large batches
+ * Speedup: ~100x for large batches
  */
 
 /**

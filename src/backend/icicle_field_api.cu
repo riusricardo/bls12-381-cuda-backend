@@ -31,10 +31,10 @@
  * 3. Use REGISTER_*_BACKEND macros for static initialization
  * 
  * The actual kernel implementations are in:
- * - field_backend.cu: NTT operations (ntt_cuda, init_domain_cuda, etc.)
+ * - ntt_kernels.cu: NTT operations (ntt_cuda, init_domain_cuda, etc.)
  * - vec_ops.cu: Vector operations (vec_add, vec_sub, vec_mul, etc.)
  * 
- * Build: Compiled together with field_backend.cu, vec_ops.cu, params.cu
+ * Build: Compiled together with ntt_kernels.cu, vec_ops.cu
  */
 
 #include "field.cuh"
@@ -54,7 +54,7 @@ using icicle::VecOpsConfig;
 // Forward declarations to implementation functions in other .cu files
 // =============================================================================
 
-// From field_backend.cu
+// From ntt_kernels.cu
 namespace ntt {
     template<typename Fr>
     eIcicleError ntt_cuda(

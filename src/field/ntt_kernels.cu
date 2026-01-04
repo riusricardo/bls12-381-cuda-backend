@@ -34,7 +34,7 @@
  *    - ntt_bit_reverse_kernel: Bit-reversal permutation
  *    - ntt_butterfly_kernel: Single Radix-2 butterfly stage
  *    - ntt_scale_kernel: Scaling for inverse NTT
- *    - ntt_shared_memory_kernel: Optimized for small sizes (≤1024)
+ *    - ntt_shared_memory_kernel: Optimized for small sizes (≤256)
  *    - intt_shared_memory_kernel: Inverse version of above
  *    - ntt_butterfly_fused_2stage_kernel: Fused 2-stage for larger sizes
  *    - ntt_radix4_kernel: True Radix-4 butterfly (alternative optimization)
@@ -51,8 +51,8 @@
  * 
  * OPTIMIZATIONS:
  * ==============
- * - Small NTT (≤1024): Uses shared memory kernel - entire transform in SRAM
- * - Large NTT (>1024): Uses fused 2-stage butterfly - 50% fewer kernel launches
+ * - Small NTT (≤256): Uses shared memory kernel - entire transform in SRAM
+ * - Large NTT (>256): Uses fused 2-stage butterfly - 50% fewer kernel launches
  * - All operations use Montgomery form for efficient modular arithmetic
  */
 
@@ -186,7 +186,10 @@ __global__ void ntt_scale_kernel(
 /**
  * @brief Shared memory NTT kernel for small transforms
  * 
- * Processes entire NTT in shared memory when size <= 1024.
+ * Processes entire NTT in shared memory when size <= 1024 (capability).
+ * NOTE: Currently used only for sizes <= 256 (threshold) because fused
+ * butterfly kernels achieve 3x better throughput for sizes 64-256.
+ * 
  * This dramatically reduces global memory traffic - only 2 accesses per element
  * instead of 2*log_size accesses with the standard approach.
  * 
@@ -1563,6 +1566,9 @@ __global__ void compute_coset_powers_phase2_kernel(
  * 
  * For sizes <= 1024, use a single block with shared memory for maximum efficiency.
  * Work complexity: O(n) instead of O(n log n)
+ * 
+ * NOTE: Requires 2*size*sizeof(Fr) = 64KB shared memory for size=1024.
+ * GPUs with < 64KB shared memory will fall back to smaller block sizes.
  */
 __global__ void compute_coset_powers_small_kernel(
     Fr* coset_powers,

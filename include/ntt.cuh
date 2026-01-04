@@ -25,7 +25,7 @@
  * 
  * This header provides:
  * - NTT Domain class for managing precomputed twiddle factors
- * - API declarations for NTT functions (implementations in field_backend.cu)
+ * - API declarations for NTT functions (implementations in ntt_kernels.cu)
  * - Coset NTT helper kernels (template kernels used by coset operations)
  * 
  * ARCHITECTURE NOTE:
@@ -33,8 +33,8 @@
  * CUDA static libraries require kernels to be defined in the same compilation
  * unit that calls them. Therefore:
  * 
- * - Core NTT kernels (bit-reverse, butterfly, scale) are defined in field_backend.cu
- * - Only coset helper kernels are templates here (they get instantiated in field_backend.cu)
+ * - Core NTT kernels (bit-reverse, butterfly, scale) are defined in ntt_kernels.cu
+ * - Only coset helper kernels are templates here (they get instantiated in ntt_kernels.cu)
  * - DO NOT add __global__ kernel implementations here unless they are templates
  *   that will be instantiated by each .cu file that uses them
  * 
@@ -87,7 +87,7 @@ public:
     size_t size;
     bool coset_initialized;   // Whether coset powers have been computed
     
-    // Global domain registry - declared extern, defined in field_backend.cu
+    // Global domain registry - declared extern, defined in ntt_kernels.cu
     static Domain* domains[MAX_LOG_DOMAIN_SIZE];
     static std::mutex domains_mutex;
     
@@ -114,10 +114,10 @@ public:
 };
 
 // =============================================================================
-// Coset NTT Helper Kernels (Template - instantiated in field_backend.cu)
+// Coset NTT Helper Kernels (Template - instantiated in ntt_kernels.cu)
 // =============================================================================
 // NOTE: Core NTT kernels (bit-reverse, butterfly, scale, fused) are defined
-// directly in field_backend.cu to ensure proper CUDA device code linking.
+// directly in ntt_kernels.cu to ensure proper CUDA device code linking.
 // Only these coset helpers need to be templates since coset_ntt_cuda uses them.
 
 /**
@@ -220,14 +220,14 @@ __global__ void coset_div_precomputed_kernel(
 }
 
 // =============================================================================
-// NTT API Declarations (Implementations in field_backend.cu)
+// NTT API Declarations (Implementations in ntt_kernels.cu)
 // =============================================================================
 
 /**
  * @brief NTT using Cooley-Tukey algorithm
  * 
  * This matches the Icicle ntt_cuda signature.
- * Implementation is in field_backend.cu
+ * Implementation is in ntt_kernels.cu
  */
 template<typename F>
 eIcicleError ntt_cuda(

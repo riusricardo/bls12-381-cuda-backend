@@ -449,7 +449,7 @@ __device__ __forceinline__ void g2_cmov(
  * @brief Double a projective point: result = 2 * P (Constant-Time)
  * 
  * Uses the doubling formula for short Weierstrass curves y^2 = x^3 + b
- * Cost: 1S + 5M + 8add
+ * Cost: 4S + 3M + 8add + 4sub
  * 
  * NOTE: This function is safe for in-place operation (result == p)
  * SECURITY: Uses constant-time selection for identity handling to prevent
@@ -787,7 +787,7 @@ __device__ __forceinline__ void g1_to_affine(G1Affine& result, const G1Projectiv
  * @brief Double a G2 projective point: result = 2 * P (Constant-Time)
  * 
  * Uses the doubling formula for y^2 = x^3 + b where b = 4(1+i) for G2.
- * Cost: 1S + 5M + 8add (in Fq2)
+ * Cost: 4S + 3M + 8add + 4sub (in Fq2)
  * 
  * NOTE: This function is safe for in-place operation (result == p)
  * SECURITY: Uses constant-time selection for identity handling to prevent

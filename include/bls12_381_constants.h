@@ -29,7 +29,7 @@
  * This file contains all cryptographic constants for the BLS12-381 curve.
  * All values are defined here ONCE and consumed by both:
  *   - Host code (via constexpr arrays in bls12_381_params.cuh)
- *   - Device code (via __constant__ arrays in src/params.cu)
+ *   - Device code (via static __device__ __constant__ arrays in bls12_381_params.cuh)
  * 
  * DO NOT define these constants anywhere else. Any modification to curve
  * parameters must be made in this file only.

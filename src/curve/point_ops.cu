@@ -37,9 +37,9 @@
  * EXPERIMENTAL (GLV_ENABLED flag):
  * - GLV endomorphism for ~2x faster scalar multiplication
  * - Batch scalar multiplication APIs
- * - Currently NOT USED: MSM uses Pippenger algorithm in msm.cu instead
+ * - Currently NOT USED: MSM uses Pippenger algorithm in msm_kernels.cu instead
  * 
- * Performance note: For MSM, use the specialized Pippenger implementation in msm.cu.
+ * Performance note: For MSM, use the specialized Pippenger implementation in msm_kernels.cu.
  */
 
 #include "point.cuh"

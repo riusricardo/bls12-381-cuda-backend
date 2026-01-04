@@ -550,7 +550,7 @@ __device__ __forceinline__ void field_mul(
  * @brief Montgomery squaring: result = a^2 * R^{-1} mod p
  * 
  * Optimized squaring exploiting a[i]*a[j] = a[j]*a[i] symmetry.
- * Saves ~30% compared to general multiplication.
+ * Saves ~40% compared to general multiplication.
  */
 template<typename Config>
 __device__ __forceinline__ void field_sqr(
@@ -678,7 +678,7 @@ __device__ __forceinline__ void field_neg(
  * 
  * Uses a combination of squarings and multiplications that's more efficient
  * than the basic binary method. For Fr (BLS12-381 scalar field), this
- * achieves inversion in ~300 operations vs ~510 for naive Fermat.
+ * achieves inversion in ~300 operations vs ~380 for naive Fermat.
  * 
  * The exponent is p-2, and we use addition chains optimized for the 
  * specific structure of the BLS12-381 primes.
