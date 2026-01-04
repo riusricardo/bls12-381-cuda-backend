@@ -20,7 +20,7 @@
  */
 
 /**
- * @file field_backend.cu
+ * @file ntt_kernels.cu
  * @brief NTT and Field Backend Implementation
  * 
  * This file contains the complete NTT implementation for the BLS12-381 scalar field.

@@ -21,7 +21,7 @@
 
 /**
  * @file bls12_381_params.cuh
- * @brief BLS12-381 CUDA type definitions and constant declarations
+ * @brief BLS12-381 CUDA constants for host and device
  * 
  * =============================================================================
  * Architecture
@@ -29,14 +29,13 @@
  * 
  * This file provides:
  *   1. Host-side constexpr arrays - for CPU code paths
- *   2. Device extern declarations - for GPU code (defined in src/params.cu)
+ *   2. Device-side __constant__ arrays - for GPU code paths
  * 
  * All constant VALUES are defined in bls12_381_constants.h (single source of
- * truth). This file merely creates the appropriate C++/CUDA bindings.
+ * truth). This file creates the appropriate C++/CUDA bindings.
  * 
- * Build requires CUDA separate compilation:
- *   nvcc -dc -rdc=true  (compile)
- *   nvcc -dlink         (device link)
+ * Device constants are defined inline using static __device__ __constant__
+ * which avoids the need for separate compilation and device linking.
  * 
  * =============================================================================
  */
@@ -67,12 +66,12 @@ constexpr uint64_t FQ_R2_HOST[FP_LIMBS_64]      = FQ_R2_LIMBS;
 constexpr uint64_t FQ_INV                       = FQ_INV_VALUE;
 
 // =============================================================================
-// Base Field Fq - Device Constants (defined in src/params.cu)
+// Base Field Fq - Device Constants
 // =============================================================================
 
-extern __device__ __constant__ uint64_t FQ_MODULUS[FP_LIMBS_64];
-extern __device__ __constant__ uint64_t FQ_ONE[FP_LIMBS_64];
-extern __device__ __constant__ uint64_t FQ_R2[FP_LIMBS_64];
+static __device__ __constant__ uint64_t FQ_MODULUS[FP_LIMBS_64] = FQ_MODULUS_LIMBS;
+static __device__ __constant__ uint64_t FQ_ONE[FP_LIMBS_64]     = FQ_ONE_LIMBS;
+static __device__ __constant__ uint64_t FQ_R2[FP_LIMBS_64]      = FQ_R2_LIMBS;
 
 // =============================================================================
 // Scalar Field Fr - Host Constants
@@ -84,12 +83,12 @@ constexpr uint64_t FR_R2_HOST[FR_LIMBS_64]      = FR_R2_LIMBS;
 constexpr uint64_t FR_INV                       = FR_INV_VALUE;
 
 // =============================================================================
-// Scalar Field Fr - Device Constants (defined in src/params.cu)
+// Scalar Field Fr - Device Constants
 // =============================================================================
 
-extern __device__ __constant__ uint64_t FR_MODULUS[FR_LIMBS_64];
-extern __device__ __constant__ uint64_t FR_ONE[FR_LIMBS_64];
-extern __device__ __constant__ uint64_t FR_R2[FR_LIMBS_64];
+static __device__ __constant__ uint64_t FR_MODULUS[FR_LIMBS_64] = FR_MODULUS_LIMBS;
+static __device__ __constant__ uint64_t FR_ONE[FR_LIMBS_64]     = FR_ONE_LIMBS;
+static __device__ __constant__ uint64_t FR_R2[FR_LIMBS_64]      = FR_R2_LIMBS;
 
 // =============================================================================
 // G1 Curve Parameters - Host Constants
@@ -123,14 +122,10 @@ constexpr uint64_t G2_GENERATOR_Y_C1[FP_LIMBS_64] = G2_GEN_Y_C1_LIMBS;
 // Maximum NTT size: 2^32 (determined by scalar field order r-1 = 2^32 * m)
 constexpr int MAX_NTT_LOG_SIZE = 32;
 
-// Primitive 2^32-th root of unity in Fr (Montgomery form)
-// omega = generator^((r-1)/2^32)
-// Verified against BLST and Arkworks implementations
-constexpr uint64_t FR_OMEGA[FR_LIMBS_64] = {
-    0xb9b58d8c5f0e466aULL,
-    0x5b1b4c801819d7ecULL,
-    0x0af53ae352a31e64ULL,
-    0x5bf3adda19e9b27bULL
-};
+// Primitive 2^32-th root of unity in Fr (Montgomery form) - Host
+constexpr uint64_t FR_OMEGA_HOST[FR_LIMBS_64] = FR_OMEGA_LIMBS;
+
+// Primitive 2^32-th root of unity in Fr (Montgomery form) - Device
+static __device__ __constant__ uint64_t FR_OMEGA[FR_LIMBS_64] = FR_OMEGA_LIMBS;
 
 } // namespace bls12_381

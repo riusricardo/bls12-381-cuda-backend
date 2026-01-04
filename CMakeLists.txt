@@ -119,9 +119,8 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include/icicle)
 
 # Field library sources
 set(FIELD_SOURCES
-    src/params.cu
     src/field/vec_ops.cu
-    src/field/field_backend.cu
+    src/field/ntt_kernels.cu
     src/backend/icicle_field_api.cu
 )
 

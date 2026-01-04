@@ -120,6 +120,15 @@
 #define FR_R2_L2       0x05d314967254398fULL
 #define FR_R2_L3       0x0748d9d99f59ff11ULL
 
+/* Primitive 2^32-th root of unity in Fr (Montgomery form)
+ * omega = generator^((r-1)/2^32)
+ * Used for NTT operations up to size 2^32
+ * Verified against BLST and Arkworks implementations */
+#define FR_OMEGA_L0    0xb9b58d8c5f0e466aULL
+#define FR_OMEGA_L1    0x5b1b4c801819d7ecULL
+#define FR_OMEGA_L2    0x0af53ae352a31e64ULL
+#define FR_OMEGA_L3    0x5bf3adda19e9b27bULL
+
 /* ============================================================================
  * G1 Curve Parameters
  * ============================================================================
@@ -233,6 +242,8 @@
 #define FR_ONE_LIMBS      { FR_ONE_L0, FR_ONE_L1, FR_ONE_L2, FR_ONE_L3 }
 
 #define FR_R2_LIMBS       { FR_R2_L0, FR_R2_L1, FR_R2_L2, FR_R2_L3 }
+
+#define FR_OMEGA_LIMBS    { FR_OMEGA_L0, FR_OMEGA_L1, FR_OMEGA_L2, FR_OMEGA_L3 }
 
 #define G1_B_LIMBS        { G1_B_L0, G1_B_L1, G1_B_L2, \
                             G1_B_L3, G1_B_L4, G1_B_L5 }
