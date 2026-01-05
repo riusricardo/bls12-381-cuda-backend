@@ -671,15 +671,15 @@ inline LaunchConfig get_msm_reduction_config(int num_windows, int num_buckets, i
     
     if (num_buckets >= GPUConfig::MSM_MULTITHREAD_THRESHOLD) {
         // Multi-threaded: one block per window
-        // Need 2 arrays for reduction: shared_mem = 2 * threads * element_size
-        // Max threads = shared_mem_per_block / (2 * element_size)
-        int max_threads_by_shared = gpu.shared_mem_per_block / (2 * element_size);
+        // Need: 2 arrays of P elements + 1 array of int counts
+        // shared_mem = 2 * threads * element_size + threads * sizeof(int)
+        int max_threads_by_shared = gpu.shared_mem_per_block / (2 * element_size + sizeof(int));
         max_threads_by_shared = (max_threads_by_shared / gpu.warp_size) * gpu.warp_size;  // Round to warp
         
         int threads = std::min({GPUConfig::DEFAULT_COMPUTE_THREADS, optimal, max_threads_by_shared});
         threads = std::max(threads, gpu.warp_size);  // At least one warp
         
-        size_t shared_mem = 2 * threads * element_size;
+        size_t shared_mem = 2 * threads * element_size + threads * sizeof(int);
         return LaunchConfig(threads, num_windows, shared_mem);
     } else {
         // Simple: one thread per window

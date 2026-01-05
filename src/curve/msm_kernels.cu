@@ -399,6 +399,18 @@ __global__ void parallel_bucket_reduction_kernel(
 
 /**
  * @brief Multi-threaded bucket reduction - one block per window
+ * 
+ * Optimized triangle summation: each thread computes a partial triangle,
+ * then thread 0 combines using closed-form adjustment formulas to avoid O(n) loops.
+ * 
+ * Triangle sum: Σ_{i=1}^{n} i * bucket[i] = Σ running_sum where running_sum accumulates
+ * 
+ * For thread t handling buckets [start, end):
+ *   local_running = Σ bucket[i] for i in [start, end)
+ *   local_window  = Σ_{i=start}^{end-1} (end-i) * bucket[i]  (partial triangle)
+ * 
+ * To combine: each thread's window sum needs adjustment by the suffix sum
+ * (sum of all buckets after this thread's range) multiplied by the count.
  */
 template<typename P>
 __global__ void parallel_bucket_reduction_multithread_kernel(
@@ -419,10 +431,13 @@ __global__ void parallel_bucket_reduction_multithread_kernel(
     int buckets_per_thread = (num_buckets + THREADS_PER_WINDOW - 1) / THREADS_PER_WINDOW;
     int start_bucket = tid * buckets_per_thread;
     int end_bucket = min(start_bucket + buckets_per_thread, num_buckets);
+    int my_count = max(0, end_bucket - start_bucket);
     
     P local_running = P::identity();
     P local_window = P::identity();
     
+    // Compute local triangle sum for this thread's bucket range
+    // We process from high to low: running_sum accumulates, window adds running each step
     for (int i = end_bucket - 1; i >= start_bucket; i--) {
         point_add(local_running, local_running, window_buckets[i]);
         point_add(local_window, local_window, local_running);
@@ -431,26 +446,48 @@ __global__ void parallel_bucket_reduction_multithread_kernel(
     extern __shared__ char shared_mem[];
     P* shared_running = reinterpret_cast<P*>(shared_mem);
     P* shared_window = shared_running + THREADS_PER_WINDOW;
+    int* shared_counts = reinterpret_cast<int*>(shared_window + THREADS_PER_WINDOW);
     
     shared_running[tid] = local_running;
     shared_window[tid] = local_window;
+    shared_counts[tid] = my_count;
     __syncthreads();
     
+    // Thread 0 combines all partial results
+    // Key insight: thread t's window needs suffix_sum * my_count added
+    // where suffix_sum = Σ shared_running[t+1..end]
     if (tid == 0) {
         P total_window = P::identity();
         P suffix_sum = P::identity();
         
+        // Process from highest thread to lowest
         for (int t = THREADS_PER_WINDOW - 1; t >= 0; t--) {
-            int t_start = t * buckets_per_thread;
-            int t_buckets = min(buckets_per_thread, num_buckets - t_start);
-            if (t_buckets <= 0) continue;
+            int t_count = shared_counts[t];
+            if (t_count <= 0) continue;
             
-            P adjusted_window = shared_window[t];
-            for (int k = 0; k < t_buckets; k++) {
-                point_add(adjusted_window, adjusted_window, suffix_sum);
+            // Add this thread's partial window
+            point_add(total_window, total_window, shared_window[t]);
+            
+            // Add suffix_sum * t_count using repeated doubling
+            // This converts O(t_count) additions to O(log(t_count)) doubles + additions
+            if (!suffix_sum.is_identity()) {
+                P adjustment = P::identity();
+                P base = suffix_sum;
+                int remaining = t_count;
+                
+                while (remaining > 0) {
+                    if (remaining & 1) {
+                        point_add(adjustment, adjustment, base);
+                    }
+                    remaining >>= 1;
+                    if (remaining > 0) {
+                        point_double(base, base);
+                    }
+                }
+                point_add(total_window, total_window, adjustment);
             }
-            point_add(total_window, total_window, adjusted_window);
             
+            // Update suffix sum for next (lower) thread
             point_add(suffix_sum, suffix_sum, shared_running[t]);
         }
         
