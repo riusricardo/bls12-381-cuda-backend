@@ -217,7 +217,7 @@ __device__ __constant__ uint64_t GLV_G2[4] = {
  * @param k2_sign Output: sign of k2 (0 = positive, 1 = negative)
  * @param k Input scalar
  * 
- * SECURITY: This function is constant-time with respect to the scalar value.
+ * This function is constant-time with respect to the scalar value.
  */
 __device__ __forceinline__ void glv_decompose(
     uint64_t k1_out[2], int& k1_sign,
@@ -312,7 +312,7 @@ __device__ __forceinline__ void glv_decompose(
 /**
  * @brief Constant-time table lookup for G1 points
  * 
- * SECURITY: Executes in constant time regardless of index value.
+ * Executes in constant time regardless of index value.
  * Prevents cache-timing side-channel attacks.
  * 
  * @param result Output point
@@ -349,7 +349,7 @@ constexpr int SCALAR_MUL_TABLE_SIZE = (1 << SCALAR_MUL_WINDOW); // 16
  * Uses GLV decomposition to split 255-bit scalar into two ~128-bit halves,
  * then computes k1*P + k2*φ(P) using Shamir's trick with windowed method.
  * 
- * SECURITY: Uses constant-time table lookup to prevent timing attacks.
+ * Uses constant-time table lookup to prevent timing attacks.
  */
 __global__ void batch_scalar_mul_g1_glv_kernel(
     G1Projective* output,
@@ -533,7 +533,7 @@ __global__ void batch_scalar_mul_g1_kernel(
         int window_val = (int)window;
         
         // Add table[window_val] to result using constant-time lookup
-        // SECURITY: Prevents cache-timing side-channel attacks
+        // Prevents cache-timing side-channel attacks
         G1Projective contrib;
         g1_table_lookup_ct(contrib, table, SCALAR_MUL_TABLE_SIZE, window_val);
         
@@ -1007,7 +1007,7 @@ eIcicleError bls12_381_g2_projective_to_affine(
  * Uses GLV endomorphism to decompose 255-bit scalars into two ~128-bit halves,
  * providing approximately 2x speedup over naive windowed method.
  * 
- * SECURITY: Uses constant-time table lookup to prevent cache-timing attacks.
+ * Uses constant-time table lookup to prevent cache-timing attacks.
  * 
  * @param bases Input affine points (size elements)
  * @param scalars Input scalars (size elements)
@@ -1144,7 +1144,7 @@ eIcicleError bls12_381_g1_scalar_mul_glv(
  * Uses windowed method with w=4 precomputation table.
  * For better performance, use bls12_381_g1_scalar_mul_glv.
  * 
- * SECURITY: Uses constant-time table lookup to prevent cache-timing attacks.
+ * Uses constant-time table lookup to prevent cache-timing attacks.
  */
 eIcicleError bls12_381_g1_scalar_mul(
     const G1Affine* bases,

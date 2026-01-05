@@ -99,6 +99,12 @@ constexpr uint64_t G1_GENERATOR_X[FP_LIMBS_64] = G1_GEN_X_LIMBS;
 constexpr uint64_t G1_GENERATOR_Y[FP_LIMBS_64] = G1_GEN_Y_LIMBS;
 
 // =============================================================================
+// G1 Curve Parameters - Device Constants
+// =============================================================================
+
+static __device__ __constant__ uint64_t G1_B_DEV[FP_LIMBS_64] = G1_B_LIMBS;
+
+// =============================================================================
 // G2 Curve Parameters - Host Constants
 // =============================================================================
 // G2 coordinates are Fq2 elements: each has c0 (real) and c1 (imaginary) parts
@@ -106,6 +112,13 @@ constexpr uint64_t G1_GENERATOR_Y[FP_LIMBS_64] = G1_GEN_Y_LIMBS;
 // Curve coefficient b' = 4(1+u) in Fq2
 constexpr uint64_t G2_B_C0[FP_LIMBS_64]           = G2_B_C0_LIMBS;
 constexpr uint64_t G2_B_C1[FP_LIMBS_64]           = G2_B_C1_LIMBS;
+
+// =============================================================================
+// G2 Curve Parameters - Device Constants
+// =============================================================================
+
+static __device__ __constant__ uint64_t G2_B_C0_DEV[FP_LIMBS_64] = G2_B_C0_LIMBS;
+static __device__ __constant__ uint64_t G2_B_C1_DEV[FP_LIMBS_64] = G2_B_C1_LIMBS;
 
 // Generator x coordinate (Fq2)
 constexpr uint64_t G2_GENERATOR_X_C0[FP_LIMBS_64] = G2_GEN_X_C0_LIMBS;

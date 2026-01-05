@@ -96,12 +96,27 @@ struct ComplexExtensionField {
         return ComplexExtensionField(BaseField::one(), BaseField::zero());
     }
 
+    /**
+     * Constant-time zero check.
+     * Uses bitwise OR to avoid short-circuit evaluation.
+     */
     __host__ __device__ bool is_zero() const {
-        return c0.is_zero() && c1.is_zero();
+        // Avoid short-circuit && which leaks timing
+        // Both is_zero() calls execute regardless of first result
+        bool c0_zero = c0.is_zero();
+        bool c1_zero = c1.is_zero();
+        return c0_zero & c1_zero;  // Bitwise AND, no short-circuit
     }
 
+    /**
+     * Constant-time equality check.
+     * Both component comparisons execute regardless of first result.
+     */
     __host__ __device__ bool operator==(const ComplexExtensionField& other) const {
-        return c0 == other.c0 && c1 == other.c1;
+        // Avoid short-circuit && which leaks timing
+        bool c0_eq = (c0 == other.c0);
+        bool c1_eq = (c1 == other.c1);
+        return c0_eq & c1_eq;  // Bitwise AND, no short-circuit
     }
 
     __host__ __device__ bool operator!=(const ComplexExtensionField& other) const {
@@ -166,16 +181,14 @@ __device__ __forceinline__ void fq2_neg(Fq2& result, const Fq2& a) {
     field_neg(result.c1, a.c1);
 }
 
+/**
+ * @brief Fq2 inversion: result = 1/a in Fq2
+ *
+ * This function is constant-time. The inversion is always
+ * computed, and edge cases (zero input, zero norm) are handled using
+ * constant-time selection. Returns zero for invalid inputs.
+ */
 __device__ __forceinline__ void fq2_inv(Fq2& result, const Fq2& a) {
-    // Validate input is non-zero to prevent division by zero
-    // Note: Caller should handle zero inputs appropriately
-    if (a.is_zero()) {
-        // Cannot invert zero - return zero and let caller handle
-        // (In correct cryptographic operations, this should never occur)
-        result = Fq2::zero();
-        return;
-    }
-    
     // (a0 + a1*u)^-1 = (a0 - a1*u) / (a0^2 + a1^2)
     // For u^2 = -1: norm = a0^2 + a1^2
     Fq t0, t1, norm, norm_inv;
@@ -184,18 +197,31 @@ __device__ __forceinline__ void fq2_inv(Fq2& result, const Fq2& a) {
     field_sqr(t1, a.c1);                 // a1^2
     field_add(norm, t0, t1);             // a0^2 + a1^2
     
-    // Defense in depth: norm should never be zero if input validation correct
-    // but this guards against bugs in field arithmetic
-    if (norm.is_zero()) {
-        result = Fq2::zero();
-        return;
-    }
-    
+    // Always compute inversion (field_inv handles zero input safely)
     field_inv(norm_inv, norm);           // 1 / (a0^2 + a1^2)
     
-    field_mul(result.c0, a.c0, norm_inv);  // a0 / norm
+    // Compute the inverse components
+    Fq2 computed_inv;
+    field_mul(computed_inv.c0, a.c0, norm_inv);  // a0 / norm
     field_neg(t0, a.c1);
-    field_mul(result.c1, t0, norm_inv);    // -a1 / norm
+    field_mul(computed_inv.c1, t0, norm_inv);    // -a1 / norm
+    
+    // Check if input was zero in constant-time
+    // Accumulate OR of all limbs from both components
+    uint64_t nonzero_acc = 0;
+    for (int i = 0; i < fq_config::LIMBS; i++) {
+        nonzero_acc |= a.c0.limbs[i];
+        nonzero_acc |= a.c1.limbs[i];
+    }
+    int input_is_zero = (nonzero_acc == 0) ? 1 : 0;
+    
+    // Constant-time selection: if input was zero, return zero
+    Fq2 zero_result = Fq2::zero();
+    
+    // Select between computed inverse and zero based on input validity
+    // Use field_cmov on each component
+    field_cmov(result.c0, zero_result.c0, computed_inv.c0, input_is_zero);
+    field_cmov(result.c1, zero_result.c1, computed_inv.c1, input_is_zero);
 }
 
 // Overloads for Fq2 to work with generic field templates
@@ -294,6 +320,132 @@ struct Affine {
 // Type aliases
 using G1Affine = Affine<Fq>;
 using G2Affine = Affine<Fq2>;
+
+// =============================================================================
+// Point Validation Functions
+// =============================================================================
+// These functions verify that points are on the correct curve.
+// MUST be called for any externally-provided points before use.
+
+/**
+ * @brief Check if a G1 affine point is on the curve E(Fq): y² = x³ + 4
+ * 
+ * This function should be called for all untrusted point inputs.
+ * Failure to validate points can enable invalid curve attacks.
+ * 
+ * @param p The point to validate
+ * @return true if p is on the curve or is the identity point
+ */
+__device__ __forceinline__ bool g1_is_on_curve(const G1Affine& p) {
+    // Identity is always valid
+    if (p.is_identity()) return true;
+    
+    // Check y² = x³ + b where b = 4
+    Fq x2, x3, y2, rhs, b;
+    
+    // Load curve parameter b (Montgomery form)
+    for (int i = 0; i < fq_config::LIMBS; i++) {
+        b.limbs[i] = G1_B_DEV[i];
+    }
+    
+    field_sqr(x2, p.x);          // x²
+    field_mul(x3, x2, p.x);       // x³
+    field_sqr(y2, p.y);          // y²
+    field_add(rhs, x3, b);        // x³ + b
+    
+    return y2 == rhs;
+}
+
+/**
+ * @brief Check if a G2 affine point is on the twist curve E'(Fq2): y² = x³ + 4(1+u)
+ * 
+ * This function should be called for all untrusted point inputs.
+ * Failure to validate points can enable invalid curve attacks.
+ * 
+ * @param p The point to validate
+ * @return true if p is on the curve or is the identity point
+ */
+__device__ __forceinline__ bool g2_is_on_curve(const G2Affine& p) {
+    // Identity is always valid
+    if (p.is_identity()) return true;
+    
+    // Check y² = x³ + b' where b' = 4(1+u) in Fq2
+    Fq2 x2, x3, y2, rhs, b;
+    
+    // Load curve parameter b' = 4(1+u) in Montgomery form
+    for (int i = 0; i < fq_config::LIMBS; i++) {
+        b.c0.limbs[i] = G2_B_C0_DEV[i];
+        b.c1.limbs[i] = G2_B_C1_DEV[i];
+    }
+    
+    fq2_sqr(x2, p.x);            // x²
+    fq2_mul(x3, x2, p.x);         // x³
+    fq2_sqr(y2, p.y);            // y²
+    fq2_add(rhs, x3, b);          // x³ + b'
+    
+    return y2 == rhs;
+}
+
+// =============================================================================
+// Subgroup Membership Checks
+// =============================================================================
+// BLS12-381 G2 has a large cofactor. Points on the twist curve E'(Fq2)
+// may not be in the prime-order subgroup G2. Small subgroup attacks
+// can recover private keys when operating on malicious points.
+//
+// For G1: The cofactor is small (h ≈ 2^126) but non-trivial.
+//         Subgroup check: [h]P ≠ O (multiply by cofactor)
+//
+// For G2: The cofactor is very large (~300 bits).
+//         Efficient check uses the Frobenius endomorphism:
+//         P ∈ G2 ⟺ ψ(P) = [x]P  where x is the BLS parameter
+
+/**
+ * @brief Check if a G1 point is in the prime-order subgroup
+ * 
+ * For G1, the cofactor h = (z-1)²/3 where z is the BLS parameter.
+ * A point P is in G1 iff [r]P = O (where r is the subgroup order).
+ * 
+ * Implementation: Multiply by the cofactor h. If result is not identity,
+ * the original point was not in G1.
+ * 
+ * NOTE: For most BLS12-381 use cases, G1 subgroup membership is not
+ * strictly required because the cofactor is relatively prime to r.
+ * However, it's good practice to validate externally-provided points.
+ * 
+ * @param p The G1 point to check (must already be on curve)
+ * @return true if p is in the prime-order subgroup G1
+ */
+// TODO: Implement g1_is_in_subgroup() using cofactor multiplication
+// For now, applications should call g1_is_on_curve() which catches most attacks
+
+/**
+ * @brief Check if a G2 point is in the prime-order subgroup
+ * 
+ * SECURITY CRITICAL: This check is REQUIRED for all externally-provided
+ * G2 points. Failure to perform this check enables small subgroup attacks.
+ * 
+ * Efficient implementation uses the Frobenius endomorphism ψ:
+ *   P ∈ G2 ⟺ ψ(P) = [x]P
+ * where x = -0xd201000000010000 is the BLS parameter.
+ * 
+ * The Frobenius endomorphism is:
+ *   ψ(x, y) = (x^p * c₁, y^p * c₂)
+ * where c₁, c₂ are the Frobenius coefficients.
+ * 
+ * @param p The G2 projective point to check (must already be on curve)
+ * @return true if p is in the prime-order subgroup G2
+ */
+// TODO: Implement g2_is_in_subgroup() using Frobenius endomorphism check
+// Requires:
+//   1. Frobenius coefficients in Fq2 (conjugate + multiply by coefficients)
+//   2. Scalar multiplication by x (64-bit scalar, efficient)
+//   3. Comparison of ψ(P) with [x]P
+//
+// For production use, either:
+//   A) Implement the endomorphism check (fast, O(log x) point operations)
+//   B) Multiply by the full cofactor (slow, O(log h') where h' is ~300 bits)
+//   C) Use only trusted point sources (generator, hash-to-curve)
 
 // =============================================================================
 // Projective point representation using Jacobian coordinates
@@ -400,7 +552,7 @@ __device__ __forceinline__ G2Projective g2_affine_to_projective(const G2Affine& 
 /**
  * @brief Constant-time conditional selection for G1Projective: result = cond ? a : b
  * 
- * SECURITY: This function executes in constant time regardless of the value
+ * This function executes in constant time regardless of the value
  * of `cond`. It prevents timing side-channels by avoiding branches.
  */
 __device__ __forceinline__ void g1_cmov(
@@ -452,7 +604,7 @@ __device__ __forceinline__ void g2_cmov(
  * Cost: 4S + 3M + 8add + 4sub
  * 
  * NOTE: This function is safe for in-place operation (result == p)
- * SECURITY: Uses constant-time selection for identity handling to prevent
+ * Uses constant-time selection for identity handling to prevent
  *           timing side-channels.
  */
 __device__ __forceinline__ void g1_double(G1Projective& result, const G1Projective& p) {
@@ -521,7 +673,7 @@ __device__ __forceinline__ void g1_double(G1Projective& result, const G1Projecti
  * 
  * NOTE: This function is safe for in-place operation (result == p or result == q)
  * 
- * SECURITY: No branches that depend on point values. All edge cases handled
+ * No branches that depend on point values. All edge cases handled
  *           via constant-time selection (cmov) to prevent timing side-channels.
  */
 __device__ __forceinline__ void g1_add(G1Projective& result, const G1Projective& p, const G1Projective& q) {
@@ -645,7 +797,7 @@ __device__ __forceinline__ void g1_add(G1Projective& result, const G1Projective&
  * More efficient than general addition when one point is affine.
  * NOTE: This function is safe for in-place operation (result == p)
  * 
- * SECURITY: Uses constant-time selection for all edge cases to prevent
+ * Uses constant-time selection for all edge cases to prevent
  *           timing side-channels.
  */
 __device__ __forceinline__ void g1_add_mixed(G1Projective& result, const G1Projective& p, const G1Affine& q) {
@@ -790,7 +942,7 @@ __device__ __forceinline__ void g1_to_affine(G1Affine& result, const G1Projectiv
  * Cost: 4S + 3M + 8add + 4sub (in Fq2)
  * 
  * NOTE: This function is safe for in-place operation (result == p)
- * SECURITY: Uses constant-time selection for identity handling to prevent
+ * Uses constant-time selection for identity handling to prevent
  *           timing side-channels.
  */
 __device__ __forceinline__ void g2_double(G2Projective& result, const G2Projective& p) {
@@ -859,7 +1011,7 @@ __device__ __forceinline__ void g2_double(G2Projective& result, const G2Projecti
  * 
  * NOTE: This function is safe for in-place operation (result == p or result == q)
  * 
- * SECURITY: No branches that depend on point values. All edge cases handled
+ * No branches that depend on point values. All edge cases handled
  *           via constant-time selection (cmov) to prevent timing side-channels.
  */
 __device__ __forceinline__ void g2_add(G2Projective& result, const G2Projective& p, const G2Projective& q) {
@@ -983,7 +1135,7 @@ __device__ __forceinline__ void g2_add(G2Projective& result, const G2Projective&
  * More efficient than general addition when one point is affine.
  * NOTE: This function is safe for in-place operation (result == p)
  * 
- * SECURITY: Uses constant-time selection for all edge cases to prevent
+ * Uses constant-time selection for all edge cases to prevent
  *           timing side-channels.
  */
 __device__ __forceinline__ void g2_add_mixed(G2Projective& result, const G2Projective& p, const G2Affine& q) {

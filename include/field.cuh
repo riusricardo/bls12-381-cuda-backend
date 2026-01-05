@@ -299,6 +299,7 @@ struct Field {
     }
 
     // Check if zero
+    // Constant-time using OR accumulation (no early exit)
     __host__ __device__ bool is_zero() const {
         uint64_t acc = 0;
         UNROLL_LOOP
@@ -309,12 +310,14 @@ struct Field {
     }
 
     // Equality
+    // Constant-time using XOR accumulation (no early exit)
     __host__ __device__ bool operator==(const Field& other) const {
+        uint64_t diff = 0;
         UNROLL_LOOP
         for (int i = 0; i < LIMBS; i++) {
-            if (limbs[i] != other.limbs[i]) return false;
+            diff |= (limbs[i] ^ other.limbs[i]);
         }
-        return true;
+        return diff == 0;
     }
 
     __host__ __device__ bool operator!=(const Field& other) const {
