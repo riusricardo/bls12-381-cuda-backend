@@ -1,39 +1,72 @@
-# midnight-bls12-381-cuda
+# BLS12-381 CUDA Backend
 
-CUDA-accelerated BLS12-381 cryptographic operations for midnight-zk using ICICLE.
+High-performance GPU-accelerated BLS12-381 cryptographic operations for zero-knowledge proof systems.
 
-This crate provides GPU-accelerated implementations of computationally intensive operations:
-- **Multi-Scalar Multiplication (MSM)** on G1 and G2 curves
-- **Number Theoretic Transform (NTT)** for polynomial operations  
-- **Vector Operations** for field arithmetic
+This backend provides CUDA-accelerated implementations of computationally intensive cryptographic primitives used in zkSNARK proof generation, offering significant performance improvements over CPU-only implementations for large-scale operations.
 
-## Features
+## Overview
 
-- **Zero-copy type conversions** between midnight-curves and ICICLE types
-- **Async GPU operations** with proper stream management
-- **Automatic CPU fallback** for small operations
-- **Production-ready** with compile-time safety assertions
+The BLS12-381 CUDA Backend is a purpose-built acceleration layer for zero-knowledge proof systems that leverage the BLS12-381 elliptic curve. It implements critical operations that typically dominate prover runtime:
 
-## Installation
+- **Multi-Scalar Multiplication (MSM)** - The core operation for polynomial commitments, computing `sum(scalars[i] * points[i])` on both G1 and G2 curves
+- **Number Theoretic Transform (NTT)** - Fast polynomial multiplication and evaluation used throughout the proving process
+- **Vector Operations** - Element-wise field arithmetic operations on large arrays
 
-Add this to your `Cargo.toml`:
+### Performance Characteristics
 
-```toml
-[dependencies]
-midnight-bls12-381-cuda = { version = "0.1", features = ["gpu"] }
-```
+From the ICICLE benchmarks and real-world usage:
 
-### Prerequisites
+- **MSM**: Up to 50x faster than CPU implementations for operations with 2^20 or more points
+- **NTT**: Up to 100x faster for large polynomial operations (2^22 elements)
+- **Vector Operations**: Up to 200x faster for element-wise operations on large arrays
 
-1. NVIDIA GPU with CUDA support
-2. CUDA Toolkit 12.0 or later
-3. CMake 3.18+
+The backend uses intelligent hybrid execution, automatically selecting GPU or CPU based on operation size to optimize both throughput and latency.
 
-### Building the CUDA Backend
+## Key Features
+
+### Zero-Copy Type Conversions
+Efficient memory layout compatibility between midnight-curves types and ICICLE types enables zero-copy conversions using `transmute`, eliminating unnecessary data copying between host and device memory.
+
+### Asynchronous GPU Operations
+Full support for CUDA streams enables:
+- Overlapping computation and memory transfers
+- Pipelined batch operations
+- Non-blocking GPU execution for improved throughput
+
+### Intelligent Device Selection
+Automatic hybrid CPU/GPU execution based on operation size:
+- Large operations (≥ 2^15 points) use GPU for maximum throughput
+- Small operations use CPU (BLST) to avoid GPU overhead
+- Configurable thresholds via environment variables
+
+### Production-Ready Safety
+- Compile-time assertions verify memory layout compatibility
+- RAII stream management prevents resource leaks
+- Comprehensive error handling with detailed diagnostics
+- Memory tracking and leak detection in debug builds
+
+## Prerequisites
+
+- **NVIDIA GPU**: CUDA compute capability 7.0 or higher (Volta, Turing, Ampere, Ada architectures)
+- **CUDA Toolkit**: Version 12.0 or later
+- **CMake**: Version 3.18 or higher
+- **C++ Compiler**: GCC 9+ or Clang 10+ with C++17 support
+- **Rust**: Version 1.70 or later
+
+## Building
+
+### 1. Build the CUDA Backend
 
 ```bash
 cd bls12-381
-mkdir build && cd build
+./build.sh
+```
+
+Or manually:
+
+```bash
+cd bls12-381
+mkdir -p build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
 make icicle -j$(nproc)
 sudo make icicle-install
@@ -41,39 +74,31 @@ sudo make icicle-install
 
 This installs the ICICLE CUDA backend to `/opt/icicle/lib/backend/`.
 
-## Usage
+### 2. Run Tests
 
-```rust
-use midnight_bls12_381_cuda::{
-    ensure_backend_loaded, 
-    should_use_gpu, 
-    GpuMsmContext
-};
+The backend includes comprehensive test suites:
 
-// Initialize GPU backend (call once at startup)
-ensure_backend_loaded()?;
+```bash
+# Run all tests
+make test
 
-// Check if GPU should be used for this operation size
-if should_use_gpu(points.len()) {
-    let ctx = GpuMsmContext::new()?;
-    
-    // Upload bases to GPU (done once, cached)
-    let device_bases = ctx.upload_bases(&points)?;
-    
-    // Perform MSM on GPU
-    let result = ctx.msm(&scalars, &device_bases)?;
-} else {
-    // Use CPU fallback (BLST) for small operations
-    // ...
-}
+# Run specific test suites
+./build/test_msm_security
+./build/test_ntt_security
+./build/test_curve_operations
+./build/test_field_properties
 ```
+
+## Integration
+
+For detailed integration instructions with midnight-zk or other zero-knowledge proof systems, please refer to the [Integration Guide](docs/integration.md).
 
 ## Configuration
 
 Control device selection via environment variables:
 
 - `MIDNIGHT_DEVICE`: Device selection mode
-  - `auto` (default): GPU for large ops (≥ 2^16 points), CPU for small
+  - `auto` (default): GPU for large ops (≥ 2^15 points), CPU for small
   - `gpu`: Force GPU for all operations
   - `cpu`: Force CPU for all operations (disable GPU)
 
@@ -81,35 +106,172 @@ Control device selection via environment variables:
   - Default: `/opt/icicle/lib/backend`
 
 - `MIDNIGHT_GPU_MIN_K`: Minimum K value for GPU usage
-  - Default: 16 (meaning 2^16 = 65536 points)
+  - Default: 15 (meaning 2^15 = 32768 points)
 
 ## Architecture
 
-This crate is designed as a standalone dependency that can be used in any Rust project requiring GPU-accelerated BLS12-381 operations:
+The backend is structured as a layered architecture separating high-level Rust APIs from low-level CUDA implementations:
+
+### Layer Overview
 
 ```
-midnight-bls12-381-cuda/
-├── core/                 # Main library code
-│   ├── mod.rs           # Public API and exports
-│   ├── backend.rs       # ICICLE backend initialization
-│   ├── config.rs        # Device configuration
-│   ├── msm.rs           # Multi-scalar multiplication
-│   ├── ntt.rs           # Number theoretic transform
-│   ├── stream.rs        # GPU stream management
-│   ├── types.rs         # Type conversions
-│   └── vecops.rs        # Vector operations
-├── bls12-381/           # CUDA backend C++ code
-│   ├── src/             # CUDA implementations
-│   └── CMakeLists.txt   # Build configuration
-└── Cargo.toml           # Rust package manifest
+┌─────────────────────────────────────────┐
+│   Zero-Knowledge Proof System Layer     │  (midnight-zk or other)
+├─────────────────────────────────────────┤
+│   Rust API Layer (core/)                │  Type-safe, zero-copy conversions
+├─────────────────────────────────────────┤
+│   ICICLE Runtime Layer                  │  Backend loading, device management
+├─────────────────────────────────────────┤
+│   CUDA Implementation (bls12-381/)      │  Optimized kernels, memory management
+├─────────────────────────────────────────┤
+│   CUDA Driver & Hardware                │  NVIDIA GPU
+└─────────────────────────────────────────┘
 ```
 
-## Features
+### Directory Structure
 
-- `gpu` - Enable GPU acceleration (default: disabled)
-- `trace-msm` - Add MSM operation tracing
-- `trace-fft` - Add FFT operation tracing  
-- `trace-all` - Enable all tracing features
+```
+bls12-381-cuda-backend/
+├── core/                      # Rust API layer
+│   ├── mod.rs                # Public API surface and exports
+│   ├── backend.rs            # ICICLE backend initialization and loading
+│   ├── config.rs             # Device selection and configuration
+│   ├── msm.rs                # MSM high-level API and orchestration
+│   ├── ntt.rs                # NTT high-level API and orchestration
+│   ├── stream.rs             # CUDA stream RAII wrapper
+│   ├── types.rs              # Zero-copy type conversions
+│   └── vecops.rs             # Vector operations API
+│
+├── bls12-381/                 # CUDA implementation layer
+│   ├── include/              # C++ headers
+│   │   ├── field.cuh         # Field arithmetic (Fq, Fr) with Montgomery form
+│   │   ├── point.cuh         # Elliptic curve point operations (G1, G2)
+│   │   ├── msm.cuh           # MSM algorithm (Pippenger)
+│   │   ├── ntt.cuh           # NTT algorithm (Cooley-Tukey)
+│   │   └── icicle_backend_api.cuh  # Backend registration interface
+│   │
+│   ├── src/
+│   │   ├── backend/          # ICICLE backend integration
+│   │   │   ├── icicle_field_api.cu    # Field operations registration
+│   │   │   ├── icicle_curve_api.cu    # MSM implementation and registration
+│   │   │   └── g2_registry.cu         # G2 curve operations registration
+│   │   │
+│   │   ├── curve/            # Curve operations
+│   │   │   ├── msm_kernels.cu        # MSM CUDA kernels
+│   │   │   └── point_ops.cu          # Point arithmetic kernels
+│   │   │
+│   │   ├── field/            # Field operations
+│   │   │   ├── ntt_kernels.cu        # NTT CUDA kernels
+│   │   │   └── vec_ops.cu            # Vector operation kernels
+│   │   │
+│   │   └── device/           # Device management
+│   │       └── cuda_device_api.cu    # Memory and device utilities
+│   │
+│   ├── tests/                # Comprehensive test suites
+│   │   ├── test_msm_security.cu      # MSM correctness and edge cases
+│   │   ├── test_ntt_security.cu      # NTT correctness and edge cases
+│   │   ├── test_curve_operations.cu  # Point operations validation
+│   │   └── test_field_properties.cu  # Field arithmetic validation
+│   │
+│   └── CMakeLists.txt        # Build configuration
+│
+└── Cargo.toml                # Rust package manifest
+```
+
+### Design Principles
+
+1. **Separation of Concerns**: Rust layer handles type safety and API design; CUDA layer focuses on performance
+2. **Zero-Copy Operations**: Memory layouts are compatible to enable transmute-based conversions
+3. **Fail-Fast Compilation**: Compile-time assertions catch layout mismatches before runtime
+4. **Resource Safety**: RAII patterns ensure proper cleanup of GPU resources
+5. **Extensibility**: Backend registration pattern allows easy addition of new operations
+
+## Cargo Features
+
+The backend supports the following Cargo features for build-time configuration:
+
+- **`gpu`** - Enable GPU acceleration (default: disabled for compatibility)
+  - When enabled, builds with ICICLE runtime and CUDA support
+  - When disabled, provides stub implementations that always return errors
+  
+- **`trace-msm`** - Enable detailed MSM operation tracing
+  - Logs MSM configuration, input sizes, and execution times
+  - Useful for performance analysis and debugging
+  
+- **`trace-fft`** - Enable detailed NTT/FFT operation tracing
+  - Logs NTT parameters, direction, and timing information
+  - Helps identify bottlenecks in polynomial operations
+  
+- **`trace-all`** - Enable all tracing features
+  - Equivalent to enabling both `trace-msm` and `trace-fft`
+  - Recommended for comprehensive performance profiling
+
+Example usage in `Cargo.toml`:
+
+```toml
+[dependencies]
+midnight-bls12-381-cuda = { version = "0.1", features = ["gpu", "trace-all"] }
+```
+
+## Environment Variables
+
+Runtime behavior can be controlled via environment variables:
+
+| Variable | Values | Default | Description |
+|----------|--------|---------|-------------|
+| `MIDNIGHT_DEVICE` | `auto`, `gpu`, `cpu` | `auto` | Device selection strategy |
+| `MIDNIGHT_GPU_MIN_K` | Integer (10-28) | `15` | Minimum log2(size) for GPU usage |
+| `ICICLE_BACKEND_INSTALL_DIR` | Path | `/opt/icicle/lib/backend` | ICICLE backend library location |
+| `RUST_LOG` | Log level | - | Enable tracing output (e.g., `RUST_LOG=debug`) |
+
+### Device Selection Strategies
+
+- **`auto`** (default): Intelligent hybrid execution
+  - Operations with ≥ 2^K points use GPU
+  - Smaller operations use CPU (BLST) to avoid GPU overhead
+  - Balances throughput and latency
+  
+- **`gpu`**: Force all operations to GPU
+  - Useful for benchmarking pure GPU performance
+  - May hurt performance for small operations due to PCIe transfer overhead
+  
+- **`cpu`**: Disable GPU completely
+  - All operations fall back to CPU (BLST)
+  - Useful for compatibility testing or systems without GPUs
+
+## Testing
+
+The backend includes extensive test coverage across multiple dimensions:
+
+### CUDA Test Suites
+
+```bash
+cd bls12-381/build
+
+# Security and correctness tests
+./test_msm_security          # MSM edge cases and known answer tests
+./test_ntt_security          # NTT correctness and inverse property tests
+./test_security_edge_cases   # Field and curve edge case validation
+
+# Operations tests
+./test_curve_operations      # Point addition, doubling, scalar multiplication
+./test_field_properties      # Field arithmetic properties
+./test_point_ops            # G1/G2 point operations
+./test_vec_ops              # Vector operations validation
+
+# Known answer tests
+./test_known_answer_vectors  # Test vectors from reference implementations
+```
+
+### Rust Integration Tests
+
+```bash
+# Run Rust tests (requires GPU and built CUDA backend)
+cargo test --features gpu
+
+# Run with logging
+RUST_LOG=debug cargo test --features gpu,trace-all
+```
 
 ## License
 

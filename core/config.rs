@@ -27,7 +27,7 @@
 //! # Environment Variables
 //!
 //! - `ICICLE_BACKEND_INSTALL_DIR`: Path to ICICLE backend (default: `/opt/icicle/lib/backend`)
-//! - `MIDNIGHT_GPU_MIN_K`: Minimum K for GPU usage (default: 16, meaning 2^16 = 65536 points)
+//! - `MIDNIGHT_GPU_MIN_K`: Minimum K for GPU usage (default: 15, meaning 2^15 = 32768 points)
 //! - `MIDNIGHT_DEVICE`: Device selection ("auto", "gpu", or "cpu")
 //!   - `auto` (default): Use GPU for large operations, BLST for small ones
 //!   - `gpu`: Force GPU for all operations regardless of size
