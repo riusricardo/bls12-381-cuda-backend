@@ -1598,19 +1598,20 @@ __global__ void compute_inv_kernel(Fr* omega_inv, Fr* size_inv, const Fr* omega,
 
 /**
  * @brief Initialize NTT domain with given root of unity
+ * 
+ * The domain size is determined by the order of the root of unity.
+ * For BLS12-381 Fr, the maximum is 2^32 (the 2-adicity of the field).
+ * We initialize domains lazily on first use, but precompute common sizes.
  */
 template<typename F>
 eIcicleError init_domain_cuda_impl(
     const F& root_of_unity,
     const NTTInitDomainConfig& config
 ) {
-    // Determine max log size from root of unity order
-    // For BLS12-381 Fr, max is 2^32 (root has order 2^32)
-    int max_log_size = 32;  // Default for BLS12-381
-    
-    if (config.max_log_size > 0 && config.max_log_size < max_log_size) {
-        max_log_size = config.max_log_size;
-    }
+    // For BLS12-381, the 2-adicity is 32, meaning max NTT size is 2^32
+    // However, practical circuits rarely exceed 2^24, so we default to 24
+    // to save GPU memory. Larger domains can be initialized on demand.
+    constexpr int max_log_size = 24;  // Practical default for BLS12-381
     
     cudaStream_t stream = static_cast<cudaStream_t>(config.stream);
     

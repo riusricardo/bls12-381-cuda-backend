@@ -1037,8 +1037,8 @@ int main(int argc, char** argv) {
     root_of_unity.limbs[2] = 0x0af53ae352a31e64ULL;
     root_of_unity.limbs[3] = 0x5bf3adda19e9b27bULL;
     
+    // Use default config - domain size is determined by implementation default
     NTTInitDomainConfig init_config = default_ntt_init_domain_config();
-    init_config.max_log_size = 20;  // Support up to 2^20 elements
     
     eIcicleError domain_err = bls12_381_ntt_init_domain_cuda(&root_of_unity, &init_config);
     if (domain_err != eIcicleError::SUCCESS) {

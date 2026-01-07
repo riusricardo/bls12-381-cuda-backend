@@ -130,19 +130,18 @@ inline NTTConfig<S> default_ntt_config() {
 
 // =============================================================================
 // NTT Init Domain Configuration
+// Matches ICICLE's NTTInitDomainConfig exactly for ABI compatibility
 // =============================================================================
 
 struct NTTInitDomainConfig {
-    void* stream;
-    int max_log_size;              // Maximum log size of domain to initialize
-    bool is_async;
-    void* ext;
+    void* stream;                  // icicleStreamHandle for async execution
+    bool is_async;                 // True if operation is asynchronous
+    void* ext;                     // ConfigExtension* (can be nullptr)
 };
 
 inline NTTInitDomainConfig default_ntt_init_domain_config() {
     NTTInitDomainConfig cfg;
     cfg.stream = nullptr;
-    cfg.max_log_size = 0;          // Use default
     cfg.is_async = false;
     cfg.ext = nullptr;
     return cfg;
