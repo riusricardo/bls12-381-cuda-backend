@@ -64,6 +64,7 @@ use icicle_bls12_381::curve::{
 };
 #[cfg(feature = "gpu")]
 use ff::PrimeField;
+// CurveAffine trait provides from_xy method used in ICICLE->midnight conversions
 #[cfg(feature = "gpu")]
 use halo2curves::CurveAffine;
 #[cfg(feature = "gpu")]

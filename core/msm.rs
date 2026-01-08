@@ -84,7 +84,7 @@ use icicle_core::msm::{msm, MSMConfig};
 #[cfg(feature = "gpu")]
 use icicle_runtime::{
     Device,
-    memory::{DeviceVec, HostSlice, HostOrDeviceSlice},
+    memory::{DeviceVec, HostSlice, HostOrDeviceSlice, DeviceSlice},
 };
 
 /// Errors specific to MSM operations
@@ -151,6 +151,120 @@ unsafe impl Send for GpuMsmContext {}
 #[cfg(feature = "gpu")]
 unsafe impl Sync for GpuMsmContext {}
 
+/// Wrapper for GPU bases that may be precomputed.
+///
+/// Tracks whether bases have been precomputed with ICICLE's `precompute_bases()`
+/// function, which expands the buffer by `precompute_factor` to store point multiples.
+///
+/// # Memory Layout
+///
+/// - **Non-precomputed** (`factor = 1`): Buffer size = N points
+/// - **Precomputed** (`factor > 1`): Buffer size = N × factor points
+///
+/// For precomputed bases, the buffer contains multiples:
+/// `[P₁, 2^l·P₁, ..., P₂, 2^l·P₂, ...]` where l is determined by the factor.
+///
+/// # Type Safety
+///
+/// This wrapper ensures:
+/// - MSM receives the full precomputed buffer (not sliced)
+/// - Correct `precompute_factor` is set in MSMConfig
+/// - Metadata travels with the buffer
+pub struct PrecomputedBases {
+    /// Device buffer containing bases (original or precomputed)
+    buffer: DeviceVec<IcicleG1Affine>,
+    /// Original number of bases (before precomputation)
+    original_size: usize,
+    /// Precomputation factor used (1 = no precomputation)
+    precompute_factor: i32,
+}
+
+impl PrecomputedBases {
+    /// Create from non-precomputed bases
+    pub fn new(buffer: DeviceVec<IcicleG1Affine>, size: usize) -> Self {
+        Self {
+            buffer,
+            original_size: size,
+            precompute_factor: 1,
+        }
+    }
+
+    /// Create from precomputed bases
+    pub fn new_precomputed(
+        buffer: DeviceVec<IcicleG1Affine>,
+        original_size: usize,
+        precompute_factor: i32,
+    ) -> Self {
+        debug_assert_eq!(
+            buffer.len(),
+            original_size * precompute_factor as usize,
+            "Precomputed buffer size mismatch"
+        );
+        Self {
+            buffer,
+            original_size,
+            precompute_factor,
+        }
+    }
+
+    /// Check if bases are precomputed
+    pub fn is_precomputed(&self) -> bool {
+        self.precompute_factor > 1
+    }
+
+    /// Get the precompute factor
+    pub fn factor(&self) -> i32 {
+        self.precompute_factor
+    }
+
+    /// Get the original number of bases (before precomputation)
+    pub fn original_size(&self) -> usize {
+        self.original_size
+    }
+
+    /// Get the total buffer size (original_size × factor)
+    pub fn buffer_size(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Get a slice of the full buffer (for passing to ICICLE MSM)
+    pub fn as_device_slice(&self) -> &DeviceSlice<IcicleG1Affine> {
+        &self.buffer[..]
+    }
+
+    /// Get the buffer length
+    pub fn len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Get the number of bases needed for a given number of scalars
+    ///
+    /// For precomputed bases, this validates that we have enough precomputed data.
+    pub fn required_size_for_scalars(&self, num_scalars: usize) -> Result<usize, MsmError> {
+        if num_scalars > self.original_size {
+            return Err(MsmError::InvalidInput(format!(
+                "Too many scalars ({}) for bases ({})",
+                num_scalars, self.original_size
+            )));
+        }
+
+        if self.is_precomputed() {
+            // For precomputed bases, we need the full precomputed buffer
+            // ICICLE will use the appropriate subset based on num_scalars
+            Ok(self.buffer.len())
+        } else {
+            // For normal bases, just the number of scalars
+            Ok(num_scalars)
+        }
+    }
+}
+
+// Safety: PrecomputedBases just wraps a DeviceVec and metadata
+#[cfg(feature = "gpu")]
+unsafe impl Send for PrecomputedBases {}
+#[cfg(feature = "gpu")]
+unsafe impl Sync for PrecomputedBases {}
+
 #[cfg(feature = "gpu")]
 impl GpuMsmContext {
     /// Create a new GPU MSM context
@@ -188,8 +302,8 @@ impl GpuMsmContext {
     /// * `points` - G1 affine points to upload
     ///
     /// # Returns
-    /// Device vector of bases in GPU memory
-    pub fn upload_g1_bases(&self, points: &[G1Affine]) -> Result<DeviceVec<IcicleG1Affine>, MsmError> {
+    /// Wrapped device bases (non-precomputed)
+    pub fn upload_g1_bases(&self, points: &[G1Affine]) -> Result<PrecomputedBases, MsmError> {
         use icicle_runtime::set_device;
 
         if points.is_empty() {
@@ -212,7 +326,7 @@ impl GpuMsmContext {
             .copy_from_host(HostSlice::from_slice(icicle_points))
             .map_err(|e| MsmError::ExecutionFailed(format!("Copy to device failed: {:?}", e)))?;
 
-        Ok(device_bases)
+        Ok(PrecomputedBases::new(device_bases, points.len()))
     }
 
     /// Upload G2 bases to GPU memory in Montgomery form (zero-copy conversion)
@@ -242,6 +356,151 @@ impl GpuMsmContext {
             .map_err(|e| MsmError::ExecutionFailed(format!("Copy to device failed: {:?}", e)))?;
 
         Ok(device_bases)
+    }
+
+    /// Precompute base multiples for accelerated MSM.
+    ///
+    /// This expands the base buffer by `precompute_factor`, storing point
+    /// multiples (e.g., for factor=4: [P, 2P, 4P, 8P] for each base P).
+    ///
+    /// # Performance
+    ///
+    /// Trades GPU memory for 20-30% MSM speedup (ICICLE documented):
+    /// - Factor 2: ~10-15% faster, 2x memory
+    /// - Factor 4: ~20-25% faster, 4x memory (recommended)
+    /// - Factor 8: ~25-30% faster, 8x memory
+    ///
+    /// # Arguments
+    ///
+    /// * `bases` - Affine bases to precompute
+    /// * `precompute_factor` - Number of multiples to store (2, 4, or 8)
+    ///
+    /// # Returns
+    ///
+    /// Wrapped precomputed bases (size = bases.len() * precompute_factor)
+    ///
+    /// # Memory
+    ///
+    /// Requires `bases.len() * precompute_factor * 96 bytes` of GPU memory.
+    /// Example: 1M bases, factor=4 → 384 MB
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let ctx = GpuMsmContext::new()?;
+    /// let bases = load_srs_bases();
+    ///
+    /// // Precompute for faster MSM (uses 4x memory)
+    /// let device_bases = ctx.precompute_bases(&bases, 4)?;
+    ///
+    /// // MSM automatically uses precomputed multiples
+    /// let result = ctx.msm_with_device_bases(&scalars, &device_bases)?;
+    /// ```
+    pub fn precompute_bases(
+        &self,
+        bases: &[G1Affine],
+        precompute_factor: i32,
+    ) -> Result<PrecomputedBases, MsmError> {
+        use icicle_core::msm::precompute_bases;
+        use icicle_runtime::{memory::HostSlice, set_device};
+
+        if precompute_factor < 1 || precompute_factor > 8 {
+            return Err(MsmError::InvalidInput(format!(
+                "precompute_factor must be 1-8, got {}",
+                precompute_factor
+            )));
+        }
+
+        if bases.is_empty() {
+            return Err(MsmError::InvalidInput("Empty bases array".to_string()));
+        }
+
+        // Set device context
+        set_device(&self.device)
+            .map_err(|e| MsmError::ExecutionFailed(format!("Failed to set device: {:?}", e)))?;
+
+        debug!(
+            "Precomputing bases: {} points × factor {} = {} total",
+            bases.len(),
+            precompute_factor,
+            bases.len() * precompute_factor as usize
+        );
+
+        // Convert to ICICLE format (zero-copy)
+        let icicle_bases = TypeConverter::g1_slice_as_icicle(bases);
+
+        // Upload original bases to device
+        let mut device_bases = DeviceVec::device_malloc(bases.len())
+            .map_err(|e| MsmError::ExecutionFailed(format!("Device malloc failed: {:?}", e)))?;
+
+        device_bases
+            .copy_from_host(HostSlice::from_slice(icicle_bases))
+            .map_err(|e| MsmError::ExecutionFailed(format!("Copy to device failed: {:?}", e)))?;
+
+        // Allocate expanded buffer for precomputed bases
+        let precomputed_size = bases.len() * precompute_factor as usize;
+        let mut precomputed_bases = DeviceVec::device_malloc(precomputed_size)
+            .map_err(|e| MsmError::ExecutionFailed(format!("Device malloc for precomputed failed: {:?}", e)))?;
+
+        // Configure precomputation
+        let mut cfg = MSMConfig::default();
+        cfg.precompute_factor = precompute_factor;
+        cfg.are_bases_montgomery_form = true;
+        cfg.c = 0; // Auto-select window size
+
+        // Call ICICLE precomputation
+        debug!("Calling ICICLE precompute_bases...");
+        precompute_bases::<IcicleG1Projective>(
+            &device_bases[..],
+            &cfg,
+            &mut precomputed_bases[..],
+        )
+        .map_err(|e| MsmError::ExecutionFailed(format!("Precomputation failed: {:?}", e)))?;
+
+        debug!("✓ Base precomputation successful");
+
+        Ok(PrecomputedBases::new_precomputed(
+            precomputed_bases,
+            bases.len(),
+            precompute_factor,
+        ))
+    }
+
+    /// Upload bases and optionally precompute multiples.
+    ///
+    /// This is the recommended API for uploading SRS bases with precomputation.
+    /// Use `precompute_factor > 1` to trade memory for 20-30% MSM speedup.
+    ///
+    /// # Arguments
+    ///
+    /// * `bases` - Affine bases to upload
+    /// * `precompute_factor` - Precomputation factor (1 = no precompute, 2-8 = precompute)
+    ///
+    /// # Returns
+    ///
+    /// Wrapped bases (precomputed if factor > 1)
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // Standard upload (no precompute)
+    /// let device_bases = ctx.upload_g1_bases_with_precompute(&bases, 1)?;
+    ///
+    /// // Precomputed upload (20-25% faster MSM, uses 4x memory)
+    /// let device_bases = ctx.upload_g1_bases_with_precompute(&bases, 4)?;
+    /// ```
+    pub fn upload_g1_bases_with_precompute(
+        &self,
+        bases: &[G1Affine],
+        precompute_factor: i32,
+    ) -> Result<PrecomputedBases, MsmError> {
+        if precompute_factor <= 1 {
+            // No precomputation, use standard upload
+            return self.upload_g1_bases(bases);
+        }
+
+        // Precompute and return expanded buffer
+        self.precompute_bases(bases, precompute_factor)
     }
 
     /// Compute G1 MSM: sum(scalars[i] * points[i])
@@ -315,21 +574,25 @@ impl GpuMsmContext {
         Ok(TypeConverter::icicle_to_g1_projective(&host_result[0]))
     }
 
-    /// Compute G1 MSM with pre-uploaded device bases
+    /// Compute G1 MSM with pre-uploaded device bases (supports precomputation)
     ///
     /// This is the most efficient path when bases are cached on GPU (e.g., SRS).
     /// Eliminates per-call point upload overhead.
     ///
+    /// Automatically handles precomputed bases:
+    /// - If bases are precomputed, passes full buffer and sets correct config
+    /// - If bases are normal, uses standard MSM path
+    ///
     /// # Arguments
     /// * `scalars` - Scalar multipliers (in Montgomery form)
-    /// * `device_bases` - G1 points already in GPU memory
+    /// * `precomputed_bases` - Wrapped bases (precomputed or normal)
     ///
     /// # Returns
     /// The MSM result as a G1 projective point
     pub fn msm_with_device_bases(
         &self,
         scalars: &[Scalar],
-        device_bases: &DeviceVec<IcicleG1Affine>,
+        precomputed_bases: &PrecomputedBases,
     ) -> Result<G1Projective, MsmError> {
         use icicle_runtime::set_device;
 
@@ -337,11 +600,12 @@ impl GpuMsmContext {
             return Ok(G1Projective::identity());
         }
 
-        if scalars.len() > device_bases.len() {
+        // Validate scalar count against original bases (not buffer size)
+        if scalars.len() > precomputed_bases.original_size() {
             return Err(MsmError::InvalidInput(format!(
                 "More scalars ({}) than bases ({})",
                 scalars.len(),
-                device_bases.len()
+                precomputed_bases.original_size()
             )));
         }
 
@@ -362,29 +626,44 @@ impl GpuMsmContext {
         // Configure MSM - synchronous on default stream
         // CRITICAL: Both scalars AND bases are in Montgomery form!
         // - Scalars: midnight-curves stores Fq in Montgomery form
-        // - Bases: uploaded in Montgomery form via get_or_upload_gpu_bases()
+        // - Bases: uploaded in Montgomery form via upload_g1_bases()
         // This eliminates per-MSM D2D copy + Montgomery conversion in CUDA backend.
         //
-        // ICICLE performance tuning (from docs):
-        // - precompute_factor: trades memory for ~20-30% speedup
-        // - batch_size=1: single MSM per call (batching done at higher level)
-        // - are_points_shared_in_batch: N/A for batch_size=1
-        use crate::config::{precompute_factor, msm_window_size};
+        // ICICLE precomputation handling:
+        // - If bases are precomputed: use the factor from PrecomputedBases metadata
+        // - If bases are normal: use factor from environment (typically 1)
+        // - For precomputed bases, pass the FULL buffer (ICICLE will use subset)
+        use crate::config::msm_window_size;
         let mut cfg = MSMConfig::default();
         cfg.are_scalars_montgomery_form = true;
-        cfg.are_bases_montgomery_form = true;  // Bases pre-uploaded in Montgomery form
+        // NOTE: For precomputed bases, ICICLE's precompute_bases() already handles Montgomery form
+        // Setting this to true for precomputed bases causes CUDA memory corruption
+        cfg.are_bases_montgomery_form = !precomputed_bases.is_precomputed();
         cfg.is_async = false;
-        cfg.precompute_factor = precompute_factor();
+        
+        // Use precompute factor from the bases (if precomputed) or default to 1
+        cfg.precompute_factor = precomputed_bases.factor();
+        
         if msm_window_size() > 0 {
             cfg.c = msm_window_size();
         }
 
-        // Execute MSM with device bases - zero-copy, no conversion!
+        // Execute MSM with device bases
+        // CRITICAL: For precomputed bases, pass the FULL buffer
+        // ICICLE will internally use the appropriate subset based on scalars.len()
+        let bases_slice = if precomputed_bases.is_precomputed() {
+            // Precomputed: pass full buffer (size = original_size × factor)
+            precomputed_bases.as_device_slice()
+        } else {
+            // Normal: pass only what we need
+            &precomputed_bases.as_device_slice()[..scalars.len()]
+        };
+
         msm(
             HostSlice::from_slice(icicle_scalars),
-            &device_bases[..scalars.len()],
+            bases_slice,
             &cfg,
-            &mut device_result[..],
+            device_result.as_mut_slice(),
         )
         .map_err(|e| MsmError::ExecutionFailed(format!("MSM failed: {:?}", e)))?;
 
@@ -434,19 +713,19 @@ impl GpuMsmContext {
     pub fn msm_with_device_bases_async(
         &self,
         scalars: &[Scalar],
-        device_bases: &DeviceVec<IcicleG1Affine>,
+        precomputed_bases: &PrecomputedBases,
     ) -> Result<MsmHandle, MsmError> {
         use icicle_runtime::set_device;
 
         if scalars.is_empty() {
-            return Err(MsmError::InvalidInput("Empty scalars array".to_string()));
+            return Ok(MsmHandle::identity());
         }
 
-        if scalars.len() > device_bases.len() {
+        if scalars.len() > precomputed_bases.original_size() {
             return Err(MsmError::InvalidInput(format!(
                 "More scalars ({}) than bases ({})",
                 scalars.len(),
-                device_bases.len()
+                precomputed_bases.original_size()
             )));
         }
 
@@ -469,22 +748,28 @@ impl GpuMsmContext {
             .map_err(|e| MsmError::ExecutionFailed(format!("Device malloc failed: {:?}", e)))?;
 
         // Configure MSM - ASYNC mode with dedicated stream
-        // ICICLE performance tuning parameters applied
-        use crate::config::{precompute_factor, msm_window_size};
+        use crate::config::msm_window_size;
         let mut cfg = MSMConfig::default();
         cfg.are_scalars_montgomery_form = true;
-        cfg.are_bases_montgomery_form = true;
+        // NOTE: For precomputed bases, ICICLE's precompute_bases() already handles Montgomery form
+        cfg.are_bases_montgomery_form = !precomputed_bases.is_precomputed();
         cfg.is_async = true;  // Enable async execution!
         cfg.stream_handle = stream.as_ref().into();
-        cfg.precompute_factor = precompute_factor();
+        cfg.precompute_factor = precomputed_bases.factor();
         if msm_window_size() > 0 {
             cfg.c = msm_window_size();
         }
 
         // Execute MSM - returns immediately, GPU continues in background
+        let bases_slice = if precomputed_bases.is_precomputed() {
+            precomputed_bases.as_device_slice()
+        } else {
+            &precomputed_bases.as_device_slice()[..scalars.len()]
+        };
+        
         msm(
             HostSlice::from_slice(icicle_scalars),
-            &device_bases[..scalars.len()],
+            bases_slice,
             &cfg,
             &mut device_result[..],
         )
@@ -672,33 +957,29 @@ impl GpuMsmContext {
     // Async API (icicle-halo2 pattern)
     // =========================================================================
 
-    /// Launch async G1 MSM with device bases, returns handle to wait on result.
+    /// Launch async G1 MSM with raw device bases.
     ///
-    /// This follows the icicle-halo2 pattern of creating a stream per operation:
-    /// ```rust,ignore
-    /// // From icicle-halo2 evaluation.rs:
-    /// let mut stream = IcicleStream::create().unwrap();
-    /// let mut d_result = DeviceVec::device_malloc_async(size, &stream).unwrap();
-    /// cfg.stream_handle = stream.into();
-    /// cfg.is_async = true;
-    /// // ... launch operations ...
-    /// stream.synchronize().unwrap();
-    /// stream.destroy().unwrap();
-    /// ```
+    /// # DEPRECATED
+    /// 
+    /// Prefer `msm_with_device_bases_async()` which takes `PrecomputedBases`
+    /// and correctly handles Montgomery form detection.
+    ///
+    /// # CRITICAL: Montgomery Form Requirement
+    ///
+    /// This function assumes `device_bases` are in **Montgomery form**.
+    /// Bases must be uploaded using `upload_g1_bases()` which preserves
+    /// Montgomery form via zero-copy transmute.
+    ///
+    /// **DO NOT** use this with bases created via `g1_affine_to_icicle()`
+    /// which converts OUT of Montgomery form and will produce wrong results!
     ///
     /// # Arguments
     /// * `scalars` - Scalar multipliers (in Montgomery form)
-    /// * `device_bases` - G1 points already in GPU memory
+    /// * `device_bases` - G1 points in GPU memory (**must be in Montgomery form**)
     ///
     /// # Returns
     /// A handle that can be waited on to get the result
-    ///
-    /// # Example
-    /// ```rust,ignore
-    /// let handle = ctx.msm_async(&scalars, &device_bases)?;
-    /// // ... do other work ...
-    /// let result = handle.wait()?;
-    /// ```
+    #[deprecated(since = "0.2.0", note = "Use msm_with_device_bases_async() with PrecomputedBases instead")]
     pub fn msm_async(
         &self,
         scalars: &[Scalar],
@@ -769,7 +1050,16 @@ impl GpuMsmContext {
         })
     }
 
-    /// Launch async G2 MSM with device bases
+    /// Launch async G2 MSM with raw device bases.
+    ///
+    /// # CRITICAL: Montgomery Form Requirement
+    ///
+    /// This function assumes `device_bases` are in **Montgomery form**.
+    /// Bases must be uploaded using `upload_g2_bases()` which preserves
+    /// Montgomery form via zero-copy transmute.
+    ///
+    /// **DO NOT** use this with bases created via `g2_affine_to_icicle()`
+    /// which converts OUT of Montgomery form and will produce wrong results!
     pub fn g2_msm_async(
         &self,
         scalars: &[Scalar],
@@ -839,18 +1129,6 @@ impl GpuMsmContext {
     /// different scalar sets. ICICLE's `batch_size` parameter enables computing
     /// all MSMs in one kernel launch instead of N separate launches.
     ///
-    /// # Performance
-    ///
-    /// **Sequential (current):**
-    /// ```text
-    /// 8 MSMs × 74ms = 592ms, 8 kernel launches
-    /// ```
-    ///
-    /// **Batched (this API):**
-    /// ```text
-    /// 1 batch call ≈ 75-100ms, 1 kernel launch
-    /// Expected: 6-8x speedup
-    /// ```
     ///
     /// # Memory Management
     ///
@@ -899,7 +1177,7 @@ impl GpuMsmContext {
     pub fn msm_batch_with_device_bases(
         &self,
         scalars_batch: &[&[Scalar]],
-        device_bases: &DeviceVec<IcicleG1Affine>,
+        precomputed_bases: &PrecomputedBases,
     ) -> Result<Vec<G1Projective>, MsmError> {
         // Validation
         if scalars_batch.is_empty() {
@@ -919,13 +1197,18 @@ impl GpuMsmContext {
             }
         }
 
-        if device_bases.len() < msm_size {
+        if precomputed_bases.original_size() < msm_size {
             return Err(MsmError::InvalidInput(format!(
                 "Device bases length {} is less than MSM size {}",
-                device_bases.len(),
+                precomputed_bases.original_size(),
                 msm_size
             )));
         }
+
+        // Set device context - CRITICAL for proper GPU memory access
+        use icicle_runtime::set_device;
+        set_device(&self.device)
+            .map_err(|e| MsmError::ExecutionFailed(format!("Failed to set device: {:?}", e)))?;
 
         debug!(
             "Batch MSM: {} MSMs of size {} = {} total operations",
@@ -949,29 +1232,46 @@ impl GpuMsmContext {
             .map_err(|e| MsmError::ExecutionFailed(format!("Result allocation failed: {:?}", e)))?;
 
         // Configure ICICLE for batch mode
-        use crate::config::{precompute_factor, msm_window_size};
+        use crate::config::msm_window_size;
         let mut cfg = MSMConfig::default();
         cfg.are_scalars_montgomery_form = true;
-        cfg.are_bases_montgomery_form = true;
+        // NOTE: For precomputed bases, the Montgomery form handling may differ
+        // Let ICICLE handle the format since precompute_bases already processed the bases
+        cfg.are_bases_montgomery_form = !precomputed_bases.is_precomputed();
         cfg.is_async = false;  // Synchronous for now
-        cfg.batch_size = batch_size as i32;  // CRITICAL: Enable batching
+        
+        // IMPORTANT: When using precomputation, let ICICLE infer batch_size from array dimensions!
+        // Setting cfg.batch_size explicitly causes CUDA illegal memory access with precompute_factor > 1
+        if !precomputed_bases.is_precomputed() {
+            cfg.batch_size = batch_size as i32;  // Only set when NOT precomputed
+        }
         cfg.are_points_shared_in_batch = true;  // CRITICAL: Bases are shared
-        cfg.precompute_factor = precompute_factor();
+        cfg.precompute_factor = precomputed_bases.factor();
         if msm_window_size() > 0 {
             cfg.c = msm_window_size();
         }
 
         debug!(
-            "ICICLE batch config: batch_size={}, shared_bases=true, precompute={}",
-            cfg.batch_size, cfg.precompute_factor
+            "ICICLE batch config: batch_size={}, shared_bases=true, precompute={}, is_precomputed={}",
+            cfg.batch_size, cfg.precompute_factor, precomputed_bases.is_precomputed()
+        );
+        debug!(
+            "ICICLE batch arrays: scalars={}, bases={}, results={}, expected_msm_size={}",
+            icicle_scalars.len(), precomputed_bases.buffer_size(), batch_size, msm_size
         );
 
         // Execute batch MSM - single kernel launch!
+        // Note: For precomputed bases, pass the ENTIRE buffer.
+        // ICICLE uses precompute_factor in cfg to determine how to use it.
         msm(
             HostSlice::from_slice(icicle_scalars),
-            &device_bases[..msm_size],
+            if precomputed_bases.is_precomputed() {
+                &precomputed_bases.buffer[..]
+            } else {
+                &precomputed_bases.buffer[..msm_size]
+            },
             &cfg,
-            &mut device_results[..],
+            device_results.as_mut_slice(),
         )
         .map_err(|e| MsmError::ExecutionFailed(format!("Batch MSM failed: {:?}", e)))?;
 
@@ -1012,7 +1312,7 @@ impl GpuMsmContext {
     pub fn msm_batch_with_device_bases_async(
         &self,
         scalars_batch: &[&[Scalar]],
-        device_bases: &DeviceVec<IcicleG1Affine>,
+        precomputed_bases: &PrecomputedBases,
     ) -> Result<BatchMsmHandle, MsmError> {
         // Validation
         if scalars_batch.is_empty() {
@@ -1032,13 +1332,18 @@ impl GpuMsmContext {
             }
         }
 
-        if device_bases.len() < msm_size {
+        if precomputed_bases.original_size() < msm_size {
             return Err(MsmError::InvalidInput(format!(
                 "Device bases length {} is less than MSM size {}",
-                device_bases.len(),
+                precomputed_bases.original_size(),
                 msm_size
             )));
         }
+
+        // Set device context - CRITICAL for proper GPU memory access
+        use icicle_runtime::set_device;
+        set_device(&self.device)
+            .map_err(|e| MsmError::ExecutionFailed(format!("Failed to set device: {:?}", e)))?;
 
         debug!(
             "Async Batch MSM: {} MSMs of size {} = {} total operations",
@@ -1064,15 +1369,21 @@ impl GpuMsmContext {
             .map_err(|e| MsmError::ExecutionFailed(format!("Result allocation failed: {:?}", e)))?;
 
         // Configure for async batch mode
-        use crate::config::{precompute_factor, msm_window_size};
+        use crate::config::msm_window_size;
         let mut cfg = MSMConfig::default();
         cfg.stream_handle = stream.as_ref().into();
         cfg.are_scalars_montgomery_form = true;
-        cfg.are_bases_montgomery_form = true;
+        // NOTE: For precomputed bases, ICICLE's precompute_bases() already handles Montgomery form
+        cfg.are_bases_montgomery_form = !precomputed_bases.is_precomputed();
         cfg.is_async = true;  // Async mode
-        cfg.batch_size = batch_size as i32;
+        
+        // IMPORTANT: When using precomputation, let ICICLE infer batch_size from array dimensions!
+        // Setting cfg.batch_size explicitly causes CUDA illegal memory access with precompute_factor > 1
+        if !precomputed_bases.is_precomputed() {
+            cfg.batch_size = batch_size as i32;  // Only set when NOT precomputed
+        }
         cfg.are_points_shared_in_batch = true;
-        cfg.precompute_factor = precompute_factor();
+        cfg.precompute_factor = precomputed_bases.factor();
         if msm_window_size() > 0 {
             cfg.c = msm_window_size();
         }
@@ -1083,11 +1394,17 @@ impl GpuMsmContext {
         );
 
         // Launch async batch MSM
+        let bases_slice = if precomputed_bases.is_precomputed() {
+            precomputed_bases.as_device_slice()
+        } else {
+            &precomputed_bases.as_device_slice()[..msm_size]
+        };
+        
         msm(
             HostSlice::from_slice(icicle_scalars),
-            &device_bases[..msm_size],
+            bases_slice,
             &cfg,
-            &mut device_results[..],
+            device_results.as_mut_slice(),
         )
         .map_err(|e| MsmError::ExecutionFailed(format!("Async batch MSM launch failed: {:?}", e)))?;
 
@@ -1393,16 +1710,12 @@ mod tests {
         let scalars: Vec<Scalar> = (1..=n).map(|i| Scalar::from(i as u64)).collect();
         let points: Vec<G1Affine> = (0..n).map(|_| G1Affine::generator()).collect();
 
-        // Upload points to GPU
-        let icicle_points = TypeConverter::g1_affine_slice_to_icicle_vec(&points);
-        let mut device_bases = DeviceVec::<IcicleG1Affine>::device_malloc(n as usize)
-            .expect("Device malloc failed");
-        device_bases
-            .copy_from_host(HostSlice::from_slice(&icicle_points))
-            .expect("Copy to device failed");
+        // Upload points using proper API that preserves Montgomery form
+        let device_bases = ctx.upload_g1_bases(&points).expect("Upload failed");
 
-        // Launch async MSM
-        let handle = ctx.msm_async(&scalars, &device_bases).expect("Async MSM launch failed");
+        // Launch async MSM using PrecomputedBases API
+        let handle = ctx.msm_with_device_bases_async(&scalars, &device_bases)
+            .expect("Async MSM launch failed");
 
         // Wait for result
         let result = handle.wait().expect("Async MSM wait failed");
@@ -1418,13 +1731,13 @@ mod tests {
     fn test_msm_async_empty() {
         let ctx = GpuMsmContext::new().expect("Failed to create context");
 
-        // Create minimal device bases (CUDA doesn't allow zero-size allocations)
-        // The msm_async function checks for empty scalars before using bases
-        let device_bases = DeviceVec::<IcicleG1Affine>::device_malloc(1)
-            .expect("Device malloc failed");
+        // Create minimal device bases using proper API
+        let points = vec![G1Affine::generator()];
+        let device_bases = ctx.upload_g1_bases(&points).expect("Upload failed");
 
         // Launch async MSM with empty scalars
-        let handle = ctx.msm_async(&[], &device_bases).expect("Async MSM launch failed");
+        let handle = ctx.msm_with_device_bases_async(&[], &device_bases)
+            .expect("Async MSM launch failed");
         let result = handle.wait().expect("Async MSM wait failed");
 
         assert_eq!(result, G1Projective::identity());
@@ -1439,14 +1752,11 @@ mod tests {
         let scalars: Vec<Scalar> = (1..=n).map(|i| Scalar::from(i as u64)).collect();
         let points: Vec<G1Affine> = (0..n).map(|_| G1Affine::generator()).collect();
 
-        let icicle_points = TypeConverter::g1_affine_slice_to_icicle_vec(&points);
-        let mut device_bases = DeviceVec::<IcicleG1Affine>::device_malloc(n as usize)
-            .expect("Device malloc failed");
-        device_bases
-            .copy_from_host(HostSlice::from_slice(&icicle_points))
-            .expect("Copy to device failed");
+        // Upload using proper API
+        let device_bases = ctx.upload_g1_bases(&points).expect("Upload failed");
 
-        let handle = ctx.msm_async(&scalars, &device_bases).expect("Async MSM launch failed");
+        let handle = ctx.msm_with_device_bases_async(&scalars, &device_bases)
+            .expect("Async MSM launch failed");
 
         // Test Debug implementation
         let debug_str = format!("{:?}", handle);
@@ -1616,5 +1926,184 @@ mod tests {
 
         // Consume handle
         let _ = handle.wait();
+    }
+
+    // =========================================================================
+    // Base Precomputation Tests
+    // =========================================================================
+
+    #[test]
+    fn test_precompute_factors() {
+        let ctx = GpuMsmContext::new().expect("Failed to create context");
+        let bases: Vec<G1Affine> = vec![G1Affine::generator(); 512];
+
+        for factor in [1, 2, 4, 8] {
+            let result = ctx.upload_g1_bases_with_precompute(&bases, factor);
+            assert!(result.is_ok(), "Factor {} failed: {:?}", factor, result.err());
+
+            let device_bases = result.unwrap();
+            let expected_size = if factor > 1 {
+                bases.len() * factor as usize
+            } else {
+                bases.len()
+            };
+
+            assert_eq!(
+                device_bases.len(),
+                expected_size,
+                "Wrong size for factor {}",
+                factor
+            );
+        }
+    }
+
+    #[test]
+    fn test_precompute_invalid_factor() {
+        let ctx = GpuMsmContext::new().expect("Failed to create context");
+        let bases: Vec<G1Affine> = vec![G1Affine::generator(); 128];
+
+        // Factor 0 should fail
+        assert!(
+            ctx.precompute_bases(&bases, 0).is_err(),
+            "Factor 0 should fail"
+        );
+
+        // Factor 9 should fail
+        assert!(
+            ctx.precompute_bases(&bases, 9).is_err(),
+            "Factor 9 should fail"
+        );
+
+        // Factor -1 should fail
+        assert!(
+            ctx.precompute_bases(&bases, -1).is_err(),
+            "Factor -1 should fail"
+        );
+    }
+
+    #[test]
+    fn test_precompute_empty_bases() {
+        let ctx = GpuMsmContext::new().expect("Failed to create context");
+        let bases: Vec<G1Affine> = vec![];
+
+        let result = ctx.precompute_bases(&bases, 4);
+        assert!(result.is_err(), "Empty bases should fail");
+    }
+
+    #[test]
+    fn test_precomputed_msm_correctness() {
+        let ctx = GpuMsmContext::new().expect("Failed to create context");
+
+        let size = 1024;
+        let scalars: Vec<Scalar> = (0..size)
+            .map(|i| Scalar::from((i + 1) as u64))
+            .collect();
+
+        let bases: Vec<G1Affine> = vec![G1Affine::generator(); size];
+
+        // Standard (no precompute)
+        let device_bases_std = ctx.upload_g1_bases(&bases).unwrap();
+        let result_std = ctx
+            .msm_with_device_bases(&scalars, &device_bases_std)
+            .unwrap();
+
+        // Test each precompute factor
+        for factor in [2, 4, 8] {
+            let device_bases_pre = ctx
+                .upload_g1_bases_with_precompute(&bases, factor)
+                .unwrap();
+            let result_pre = ctx
+                .msm_with_device_bases(&scalars, &device_bases_pre)
+                .unwrap();
+
+            assert_eq!(
+                result_std, result_pre,
+                "Precomputed MSM (factor={}) doesn't match standard",
+                factor
+            );
+        }
+    }
+
+    #[test]
+    fn test_precompute_different_sizes() {
+        let ctx = GpuMsmContext::new().expect("Failed to create context");
+
+        let sizes = [256, 512, 1024, 2048];
+
+        for &size in &sizes {
+            let bases: Vec<G1Affine> = vec![G1Affine::generator(); size];
+            let scalars: Vec<Scalar> = (0..size)
+                .map(|i| Scalar::from((i + 1) as u64))
+                .collect();
+
+            // Compare precomputed vs standard
+            let device_std = ctx.upload_g1_bases(&bases).unwrap();
+            let device_pre = ctx.upload_g1_bases_with_precompute(&bases, 4).unwrap();
+
+            let result_std = ctx.msm_with_device_bases(&scalars, &device_std).unwrap();
+            let result_pre = ctx.msm_with_device_bases(&scalars, &device_pre).unwrap();
+
+            assert_eq!(result_std, result_pre, "Mismatch for size {}", size);
+        }
+    }
+
+    #[test]
+    fn test_precompute_async_msm() {
+        let ctx = GpuMsmContext::new().expect("Failed to create context");
+
+        let size = 1024;
+        let scalars: Vec<Scalar> = vec![Scalar::from(42u64); size];
+        let bases: Vec<G1Affine> = vec![G1Affine::generator(); size];
+
+        // Test async MSM with precomputed bases
+        let device_pre = ctx.upload_g1_bases_with_precompute(&bases, 4).unwrap();
+
+        let handle = ctx
+            .msm_with_device_bases_async(&scalars, &device_pre)
+            .unwrap();
+        let result_async = handle.wait().unwrap();
+
+        // Compare with standard sync
+        let device_std = ctx.upload_g1_bases(&bases).unwrap();
+        let result_sync = ctx.msm_with_device_bases(&scalars, &device_std).unwrap();
+
+        assert_eq!(result_async, result_sync, "Async precomputed MSM mismatch");
+    }
+
+    #[test]
+    fn test_precompute_batch_msm() {
+        let ctx = GpuMsmContext::new().expect("Failed to create context");
+
+        let batch_size = 4;
+        let msm_size = 512;
+
+        let scalars_batch: Vec<Vec<Scalar>> = (0..batch_size)
+            .map(|i| vec![Scalar::from((i + 1) as u64); msm_size])
+            .collect();
+
+        let bases: Vec<G1Affine> = vec![G1Affine::generator(); msm_size];
+
+        // Test batch MSM with precomputed bases
+        let device_pre = ctx.upload_g1_bases_with_precompute(&bases, 4).unwrap();
+
+        let scalar_refs: Vec<&[Scalar]> = scalars_batch.iter().map(|v| &v[..]).collect();
+        let results_pre = ctx
+            .msm_batch_with_device_bases(&scalar_refs, &device_pre)
+            .unwrap();
+
+        // Compare with standard bases
+        let device_std = ctx.upload_g1_bases(&bases).unwrap();
+        let results_std = ctx
+            .msm_batch_with_device_bases(&scalar_refs, &device_std)
+            .unwrap();
+
+        assert_eq!(results_pre.len(), batch_size);
+        for i in 0..batch_size {
+            assert_eq!(
+                results_pre[i], results_std[i],
+                "Batch MSM result {} mismatch",
+                i
+            );
+        }
     }
 }

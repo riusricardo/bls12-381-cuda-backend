@@ -91,7 +91,7 @@ pub use config::{device_type, min_gpu_size, should_use_gpu, should_use_gpu_batch
 
 // GPU-specific exports (only when gpu feature is enabled)
 #[cfg(feature = "gpu")]
-pub use msm::{GpuMsmContext, MsmError, MsmHandle, G2MsmHandle, BatchMsmHandle};
+pub use msm::{GpuMsmContext, MsmError, MsmHandle, G2MsmHandle, BatchMsmHandle, PrecomputedBases};
 #[cfg(feature = "gpu")]
 pub use ntt::{GpuNttContext, NttError, NttHandle};
 #[cfg(feature = "gpu")]
@@ -110,8 +110,11 @@ pub const GPU_SUPPORT: bool = cfg!(feature = "gpu");
 /// Call this at application startup to avoid first-request latency.
 /// This function:
 /// 1. Initializes the ICICLE CUDA backend
-/// 2. Creates the global MSM executor
-/// 3. Runs a small MSM to trigger GPU memory allocation
+/// 2. Creates a temporary MSM context
+/// 3. Runs a small MSM to trigger GPU memory allocation and JIT compilation
+/// 
+/// Note: This does NOT create a persistent global context. The proof system
+/// maintains its own global context in `proofs/src/poly/kzg/msm.rs`.
 /// 
 /// Returns the warmup duration, or None if GPU is not available.
 /// 

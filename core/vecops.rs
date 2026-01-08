@@ -303,8 +303,17 @@ pub fn vector_mul(a: &[Fq], b: &[Fq]) -> Result<Vec<Fq>, VecOpsError> {
 /// GPU-accelerated scalar multiplication of vector.
 ///
 /// Computes result[i] = scalar * a[i] for all i.
+///
+/// # Performance Note
+///
+/// This uses ICICLE's `scalar_mul` with `batch_size` to broadcast the scalar
+/// efficiently without creating a full repeated vector. The scalar is passed
+/// as a single-element slice and `batch_size = a.len()` tells ICICLE to
+/// broadcast it across all elements.
 #[cfg(feature = "gpu")]
 pub fn scalar_mul(scalar: Fq, a: &[Fq]) -> Result<Vec<Fq>, VecOpsError> {
+    use icicle_core::vec_ops::scalar_mul as icicle_scalar_mul;
+
     if a.is_empty() {
         return Ok(vec![]);
     }
@@ -314,9 +323,44 @@ pub fn scalar_mul(scalar: Fq, a: &[Fq]) -> Result<Vec<Fq>, VecOpsError> {
         return Ok(a.iter().map(|x| scalar * *x).collect());
     }
 
-    // Create a vector of the scalar repeated
-    let scalars = vec![scalar; a.len()];
-    vector_mul(&scalars, a)
+    use crate::backend::ensure_backend_loaded;
+    use icicle_runtime::{Device, set_device};
+
+    ensure_backend_loaded()?;
+    
+    let device = Device::new("CUDA", 0);
+    set_device(&device)
+        .map_err(|e| VecOpsError::ExecutionFailed(format!("Failed to set device: {:?}", e)))?;
+
+    // Zero-copy conversion
+    let icicle_scalar = TypeConverter::scalar_slice_as_icicle(std::slice::from_ref(&scalar));
+    let icicle_a = TypeConverter::scalar_slice_as_icicle(a);
+
+    // Allocate result on device
+    let mut device_result = DeviceVec::<IcicleScalar>::device_malloc(a.len())
+        .map_err(|e| VecOpsError::ExecutionFailed(format!("Device malloc failed: {:?}", e)))?;
+
+    // Configure VecOps with batch_size to broadcast the single scalar
+    let mut cfg = VecOpsConfig::default();
+    cfg.batch_size = a.len() as i32;
+
+    // Execute GPU scalar multiply with broadcast
+    // icicle_scalar is length 1, batch_size = a.len() makes ICICLE broadcast it
+    icicle_scalar_mul(
+        HostSlice::from_slice(icicle_scalar),
+        HostSlice::from_slice(icicle_a),
+        &mut device_result[..],
+        &cfg,
+    )
+    .map_err(|e| VecOpsError::ExecutionFailed(format!("scalar_mul failed: {:?}", e)))?;
+
+    // Copy result back to host
+    let mut host_result = vec![<IcicleScalar as BigNum>::zero(); a.len()];
+    device_result
+        .copy_to_host(HostSlice::from_mut_slice(&mut host_result))
+        .map_err(|e| VecOpsError::ExecutionFailed(format!("Copy to host failed: {:?}", e)))?;
+
+    Ok(TypeConverter::icicle_slice_as_scalar(&host_result).to_vec())
 }
 
 // CPU fallback implementations for non-GPU builds
