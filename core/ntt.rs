@@ -122,6 +122,127 @@ impl From<GpuError> for NttError {
     }
 }
 
+// =============================================================================
+// Generic NTT Trait
+// =============================================================================
+//
+// This trait provides a generic interface for NTT operations. Fields that
+// support GPU acceleration (like Fq/BLS12-381 scalar) get the GPU implementation,
+// while other fields use CPU fallback.
+
+use ff::Field;
+
+/// Trait for types that support NTT (Number Theoretic Transform) operations.
+///
+/// This trait abstracts over the implementation details, allowing GPU-accelerated
+/// NTT for supported field types (like BLS12-381 scalar) while providing CPU
+/// fallback for other types.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use midnight_bls12_381_cuda::ntt::Ntt;
+/// use midnight_curves::Fq;
+///
+/// let coeffs: Vec<Fq> = vec![...];
+///
+/// // Forward NTT - uses GPU for Fq if available
+/// let evals = Fq::forward_ntt(&coeffs)?;
+///
+/// // Inverse NTT
+/// let recovered = Fq::inverse_ntt(&evals)?;
+/// ```
+pub trait Ntt: Field + Sized {
+    /// Perform forward NTT (coefficients -> evaluations)
+    fn forward_ntt(input: &[Self]) -> Result<Vec<Self>, NttError>;
+    
+    /// Perform inverse NTT (evaluations -> coefficients)  
+    fn inverse_ntt(input: &[Self]) -> Result<Vec<Self>, NttError>;
+    
+    /// Perform forward NTT in-place
+    fn forward_ntt_inplace(data: &mut [Self]) -> Result<(), NttError>;
+    
+    /// Perform inverse NTT in-place
+    fn inverse_ntt_inplace(data: &mut [Self]) -> Result<(), NttError>;
+    
+    /// Perform batch forward NTT
+    fn forward_ntt_batch(batch: &[Self], poly_size: usize) -> Result<Vec<Self>, NttError>;
+    
+    /// Perform batch inverse NTT
+    fn inverse_ntt_batch(batch: &[Self], poly_size: usize) -> Result<Vec<Self>, NttError>;
+    
+    /// Check if GPU NTT is available for this type
+    fn gpu_ntt_available() -> bool;
+}
+
+// =============================================================================
+// GPU-accelerated NTT implementation for Fq (BLS12-381 scalar)
+// =============================================================================
+
+/// Implement Ntt trait for Fq with GPU acceleration
+#[cfg(feature = "gpu")]
+impl Ntt for Scalar {
+    fn forward_ntt(input: &[Self]) -> Result<Vec<Self>, NttError> {
+        forward_ntt_auto(input)
+    }
+    
+    fn inverse_ntt(input: &[Self]) -> Result<Vec<Self>, NttError> {
+        inverse_ntt_auto(input)
+    }
+    
+    fn forward_ntt_inplace(data: &mut [Self]) -> Result<(), NttError> {
+        forward_ntt_inplace_auto(data)
+    }
+    
+    fn inverse_ntt_inplace(data: &mut [Self]) -> Result<(), NttError> {
+        inverse_ntt_inplace_auto(data)
+    }
+    
+    fn forward_ntt_batch(batch: &[Self], poly_size: usize) -> Result<Vec<Self>, NttError> {
+        forward_ntt_batch_auto(batch, poly_size)
+    }
+    
+    fn inverse_ntt_batch(batch: &[Self], poly_size: usize) -> Result<Vec<Self>, NttError> {
+        inverse_ntt_batch_auto(batch, poly_size)
+    }
+    
+    fn gpu_ntt_available() -> bool {
+        true
+    }
+}
+
+/// Implement Ntt trait for Fq with CPU-only when gpu feature is disabled
+#[cfg(not(feature = "gpu"))]
+impl Ntt for Scalar {
+    fn forward_ntt(input: &[Self]) -> Result<Vec<Self>, NttError> {
+        cpu::forward_ntt(input)
+    }
+    
+    fn inverse_ntt(input: &[Self]) -> Result<Vec<Self>, NttError> {
+        cpu::inverse_ntt(input)
+    }
+    
+    fn forward_ntt_inplace(data: &mut [Self]) -> Result<(), NttError> {
+        cpu::forward_ntt_inplace(data)
+    }
+    
+    fn inverse_ntt_inplace(data: &mut [Self]) -> Result<(), NttError> {
+        cpu::inverse_ntt_inplace(data)
+    }
+    
+    fn forward_ntt_batch(batch: &[Self], poly_size: usize) -> Result<Vec<Self>, NttError> {
+        cpu::forward_ntt_batch(batch, poly_size)
+    }
+    
+    fn inverse_ntt_batch(batch: &[Self], poly_size: usize) -> Result<Vec<Self>, NttError> {
+        cpu::inverse_ntt_batch(batch, poly_size)
+    }
+    
+    fn gpu_ntt_available() -> bool {
+        false
+    }
+}
+
 /// Convert our NttOrdering to ICICLE's Ordering enum
 #[cfg(feature = "gpu")]
 fn to_icicle_ordering(ordering: crate::config::NttOrdering) -> Ordering {
@@ -1540,6 +1661,205 @@ pub mod cpu {
 }
 
 // =============================================================================
+// Generic CPU NTT for any PrimeField
+// =============================================================================
+//
+// This module provides NTT for any field type using halo2curves FFT.
+// It's used by the Ntt trait's blanket implementation for non-Fq types.
+
+/// Generic CPU NTT functions for any PrimeField
+pub mod generic_cpu {
+    use super::NttError;
+    use ff::PrimeField;
+
+    /// Compute the omega (root of unity) for a given log2 size
+    #[inline]
+    pub fn compute_omega<F: PrimeField>(log_n: u32) -> F {
+        let mut omega = F::ROOT_OF_UNITY;
+        for _ in log_n..F::S {
+            omega = omega.square();
+        }
+        omega
+    }
+
+    /// Compute omega inverse for inverse NTT
+    #[inline]
+    pub fn compute_omega_inv<F: PrimeField>(log_n: u32) -> F {
+        compute_omega::<F>(log_n).invert().unwrap()
+    }
+
+    /// Forward NTT using halo2curves FFT for any PrimeField
+    pub fn forward_ntt<F>(input: &[F]) -> Result<Vec<F>, NttError>
+    where
+        F: PrimeField,
+    {
+        let n = input.len();
+        if !n.is_power_of_two() {
+            return Err(NttError::InvalidSize(format!(
+                "NTT size must be power of 2, got {}", n
+            )));
+        }
+        
+        if n == 0 {
+            return Ok(vec![]);
+        }
+
+        let log_n = n.trailing_zeros();
+        let omega = compute_omega::<F>(log_n);
+
+        let mut output = input.to_vec();
+        halo2curves::fft::best_fft(&mut output, omega, log_n);
+
+        Ok(output)
+    }
+
+    /// Forward NTT in-place using halo2curves FFT
+    pub fn forward_ntt_inplace<F>(data: &mut [F]) -> Result<(), NttError>
+    where
+        F: PrimeField,
+    {
+        let n = data.len();
+        if !n.is_power_of_two() {
+            return Err(NttError::InvalidSize(format!(
+                "NTT size must be power of 2, got {}", n
+            )));
+        }
+        
+        if n == 0 {
+            return Ok(());
+        }
+
+        let log_n = n.trailing_zeros();
+        let omega = compute_omega::<F>(log_n);
+
+        halo2curves::fft::best_fft(data, omega, log_n);
+
+        Ok(())
+    }
+
+    /// Inverse NTT using halo2curves FFT
+    pub fn inverse_ntt<F>(input: &[F]) -> Result<Vec<F>, NttError>
+    where
+        F: PrimeField,
+    {
+        let n = input.len();
+        if !n.is_power_of_two() {
+            return Err(NttError::InvalidSize(format!(
+                "NTT size must be power of 2, got {}", n
+            )));
+        }
+        
+        if n == 0 {
+            return Ok(vec![]);
+        }
+
+        let log_n = n.trailing_zeros();
+        let omega_inv = compute_omega_inv::<F>(log_n);
+
+        let mut output = input.to_vec();
+        halo2curves::fft::best_fft(&mut output, omega_inv, log_n);
+
+        // Scale by 1/n
+        let n_inv = F::from(n as u64).invert().unwrap();
+        for val in output.iter_mut() {
+            *val *= n_inv;
+        }
+
+        Ok(output)
+    }
+
+    /// Inverse NTT in-place
+    pub fn inverse_ntt_inplace<F>(data: &mut [F]) -> Result<(), NttError>
+    where
+        F: PrimeField,
+    {
+        let n = data.len();
+        if !n.is_power_of_two() {
+            return Err(NttError::InvalidSize(format!(
+                "NTT size must be power of 2, got {}", n
+            )));
+        }
+        
+        if n == 0 {
+            return Ok(());
+        }
+
+        let log_n = n.trailing_zeros();
+        let omega_inv = compute_omega_inv::<F>(log_n);
+
+        halo2curves::fft::best_fft(data, omega_inv, log_n);
+
+        // Scale by 1/n
+        let n_inv = F::from(n as u64).invert().unwrap();
+        for val in data.iter_mut() {
+            *val *= n_inv;
+        }
+
+        Ok(())
+    }
+
+    /// Batch forward NTT
+    pub fn forward_ntt_batch<F>(batch: &[F], poly_size: usize) -> Result<Vec<F>, NttError>
+    where
+        F: PrimeField,
+    {
+        if !poly_size.is_power_of_two() {
+            return Err(NttError::InvalidSize(format!(
+                "Polynomial size must be power of 2, got {}", poly_size
+            )));
+        }
+        
+        if batch.len() % poly_size != 0 {
+            return Err(NttError::InvalidSize(format!(
+                "Batch length {} not divisible by poly_size {}", batch.len(), poly_size
+            )));
+        }
+
+        let mut output = batch.to_vec();
+        let log_n = poly_size.trailing_zeros();
+        let omega = compute_omega::<F>(log_n);
+
+        for chunk in output.chunks_mut(poly_size) {
+            halo2curves::fft::best_fft(chunk, omega, log_n);
+        }
+
+        Ok(output)
+    }
+
+    /// Batch inverse NTT
+    pub fn inverse_ntt_batch<F>(batch: &[F], poly_size: usize) -> Result<Vec<F>, NttError>
+    where
+        F: PrimeField,
+    {
+        if !poly_size.is_power_of_two() {
+            return Err(NttError::InvalidSize(format!(
+                "Polynomial size must be power of 2, got {}", poly_size
+            )));
+        }
+        
+        if batch.len() % poly_size != 0 {
+            return Err(NttError::InvalidSize(format!(
+                "Batch length {} not divisible by poly_size {}", batch.len(), poly_size
+            )));
+        }
+
+        let mut output = batch.to_vec();
+        let log_n = poly_size.trailing_zeros();
+        let omega_inv = compute_omega_inv::<F>(log_n);
+        let n_inv = F::from(poly_size as u64).invert().unwrap();
+
+        for chunk in output.chunks_mut(poly_size) {
+            halo2curves::fft::best_fft(chunk, omega_inv, log_n);
+            for val in chunk.iter_mut() {
+                *val *= n_inv;
+            }
+        }
+
+        Ok(output)
+    }
+}
+
+// =============================================================================
 // Unified NTT API with GPU/CPU Decision
 // =============================================================================
 //
@@ -2249,5 +2569,77 @@ mod auto_tests {
             assert_eq!(*orig, gpu_roundtrip[i], 
                 "GPU NTT roundtrip failed at index {}", i);
         }
+    }
+}
+
+// =============================================================================
+// Ntt Trait Tests
+// =============================================================================
+
+#[cfg(test)]
+mod trait_tests {
+    use super::*;
+    use ff::Field;
+
+    /// Test Ntt trait for Fq (BLS12-381 scalar)
+    #[test]
+    fn test_ntt_trait_fq() {
+        let n = 1 << 8; // 256 elements
+        let original: Vec<Scalar> = (0..n).map(|i| Scalar::from(i as u64 + 1)).collect();
+
+        // Use trait methods
+        let evaluations = Scalar::forward_ntt(&original).expect("Trait forward NTT failed");
+        let recovered = Scalar::inverse_ntt(&evaluations).expect("Trait inverse NTT failed");
+
+        for (i, (orig, rec)) in original.iter().zip(recovered.iter()).enumerate() {
+            assert_eq!(*orig, *rec, "Trait NTT roundtrip failed at index {}", i);
+        }
+    }
+
+    /// Test Ntt trait in-place operations
+    #[test]
+    fn test_ntt_trait_inplace() {
+        let n = 1 << 6;
+        let original: Vec<Scalar> = (0..n).map(|i| Scalar::from(i as u64 * 3 + 5)).collect();
+        let mut data = original.clone();
+
+        Scalar::forward_ntt_inplace(&mut data).expect("Trait forward NTT inplace failed");
+        Scalar::inverse_ntt_inplace(&mut data).expect("Trait inverse NTT inplace failed");
+
+        for (i, (orig, rec)) in original.iter().zip(data.iter()).enumerate() {
+            assert_eq!(*orig, *rec, "Trait in-place NTT roundtrip failed at index {}", i);
+        }
+    }
+
+    /// Test Ntt trait batch operations
+    #[test]
+    fn test_ntt_trait_batch() {
+        let poly_size = 1 << 4;
+        let batch_count = 4;
+        let total_size = poly_size * batch_count;
+
+        let original: Vec<Scalar> = (0..total_size)
+            .map(|i| Scalar::from(i as u64 + 1))
+            .collect();
+
+        let evaluations = Scalar::forward_ntt_batch(&original, poly_size)
+            .expect("Trait batch forward NTT failed");
+        let recovered = Scalar::inverse_ntt_batch(&evaluations, poly_size)
+            .expect("Trait batch inverse NTT failed");
+
+        for (i, (orig, rec)) in original.iter().zip(recovered.iter()).enumerate() {
+            assert_eq!(*orig, *rec, "Trait batch NTT roundtrip failed at index {}", i);
+        }
+    }
+
+    /// Test gpu_ntt_available() reports correctly
+    #[test]
+    fn test_gpu_ntt_available() {
+        // For Fq, this should return true when gpu feature is enabled
+        #[cfg(feature = "gpu")]
+        assert!(Scalar::gpu_ntt_available());
+        
+        #[cfg(not(feature = "gpu"))]
+        assert!(!Scalar::gpu_ntt_available());
     }
 }

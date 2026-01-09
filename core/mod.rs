@@ -89,11 +89,15 @@ pub mod vecops;
 pub use backend::{ensure_backend_loaded, is_gpu_available, GpuError};
 pub use config::{device_type, min_gpu_size, should_use_gpu, should_use_gpu_batch, backend_path, device_id, DeviceType};
 
+// NTT trait and error types (always available)
+pub use ntt::{Ntt, NttError};
+pub use ntt::generic_cpu as ntt_generic;
+
 // GPU-specific exports (only when gpu feature is enabled)
 #[cfg(feature = "gpu")]
 pub use msm::{GpuMsmContext, MsmError, MsmHandle, G2MsmHandle, BatchMsmHandle, PrecomputedBases};
 #[cfg(feature = "gpu")]
-pub use ntt::{GpuNttContext, NttError, NttHandle};
+pub use ntt::{GpuNttContext, NttHandle};
 #[cfg(feature = "gpu")]
 pub use stream::ManagedStream;
 #[cfg(feature = "gpu")]
