@@ -82,12 +82,19 @@ pub mod config;
 pub mod msm;
 pub mod ntt;
 pub mod stream;
+pub mod traits;
 pub mod types;
 pub mod vecops;
 
 // Core exports
 pub use backend::{ensure_backend_loaded, is_gpu_available, GpuError};
-pub use config::{device_type, min_gpu_size, should_use_gpu, should_use_gpu_batch, backend_path, device_id, DeviceType};
+pub use config::{device_type, min_gpu_size, min_ntt_gpu_size, should_use_gpu, should_use_gpu_ntt, should_use_gpu_batch, backend_path, device_id, DeviceType};
+
+// Trait-based abstraction layer (the recommended API for consumers)
+pub use traits::{
+    AcceleratorError, AcceleratorResult, AsyncHandle, GpuAccelerator, GpuCachedBases,
+    MsmBackend, NttBackend, global_accelerator,
+};
 
 // NTT trait and error types (always available)
 pub use ntt::{Ntt, NttError};
