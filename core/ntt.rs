@@ -1463,14 +1463,14 @@ impl NttHandle {
 }
 
 // =============================================================================
-// CPU NTT Implementation (using halo2curves FFT)
+// CPU NTT Implementation (using midnight_curves FFT)
 // =============================================================================
 //
 // This provides a CPU fallback for small NTTs where GPU transfer overhead
-// would dominate. Uses halo2curves::fft::best_fft which is highly optimized
+// would dominate. Uses midnight_curves::fft::best_fft which is highly optimized
 // for CPU with SIMD support.
 
-/// CPU NTT using halo2curves FFT
+/// CPU NTT using midnight_curves FFT
 ///
 /// This is used when:
 /// - GPU feature is not enabled, or
@@ -1499,7 +1499,7 @@ pub mod cpu {
         compute_omega(log_n).invert().unwrap()
     }
 
-    /// Forward NTT using halo2curves FFT
+    /// Forward NTT using midnight_curves FFT
     ///
     /// Transforms coefficients to evaluations.
     pub fn forward_ntt(input: &[Scalar]) -> Result<Vec<Scalar>, NttError> {
@@ -1518,12 +1518,12 @@ pub mod cpu {
         let omega = compute_omega(log_n);
 
         let mut output = input.to_vec();
-        halo2curves::fft::best_fft(&mut output, omega, log_n);
+        midnight_curves::fft::best_fft(&mut output, omega, log_n);
 
         Ok(output)
     }
 
-    /// Forward NTT in-place using halo2curves FFT
+    /// Forward NTT in-place using midnight_curves FFT
     pub fn forward_ntt_inplace(data: &mut [Scalar]) -> Result<(), NttError> {
         let n = data.len();
         if !n.is_power_of_two() {
@@ -1539,12 +1539,12 @@ pub mod cpu {
         let log_n = n.trailing_zeros();
         let omega = compute_omega(log_n);
 
-        halo2curves::fft::best_fft(data, omega, log_n);
+        midnight_curves::fft::best_fft(data, omega, log_n);
 
         Ok(())
     }
 
-    /// Inverse NTT using halo2curves FFT
+    /// Inverse NTT using midnight_curves FFT
     ///
     /// Transforms evaluations back to coefficients.
     /// Applies the standard 1/n scaling.
@@ -1564,7 +1564,7 @@ pub mod cpu {
         let omega_inv = compute_omega_inv(log_n);
 
         let mut output = input.to_vec();
-        halo2curves::fft::best_fft(&mut output, omega_inv, log_n);
+        midnight_curves::fft::best_fft(&mut output, omega_inv, log_n);
 
         // Scale by 1/n
         let n_inv = Scalar::from(n as u64).invert().unwrap();
@@ -1575,7 +1575,7 @@ pub mod cpu {
         Ok(output)
     }
 
-    /// Inverse NTT in-place using halo2curves FFT
+    /// Inverse NTT in-place using midnight_curves FFT
     pub fn inverse_ntt_inplace(data: &mut [Scalar]) -> Result<(), NttError> {
         let n = data.len();
         if !n.is_power_of_two() {
@@ -1591,7 +1591,7 @@ pub mod cpu {
         let log_n = n.trailing_zeros();
         let omega_inv = compute_omega_inv(log_n);
 
-        halo2curves::fft::best_fft(data, omega_inv, log_n);
+        midnight_curves::fft::best_fft(data, omega_inv, log_n);
 
         // Scale by 1/n
         let n_inv = Scalar::from(n as u64).invert().unwrap();
@@ -1622,7 +1622,7 @@ pub mod cpu {
 
         // Process each polynomial
         for chunk in output.chunks_mut(poly_size) {
-            halo2curves::fft::best_fft(chunk, omega, log_n);
+            midnight_curves::fft::best_fft(chunk, omega, log_n);
         }
 
         Ok(output)
@@ -1649,7 +1649,7 @@ pub mod cpu {
 
         // Process each polynomial
         for chunk in output.chunks_mut(poly_size) {
-            halo2curves::fft::best_fft(chunk, omega_inv, log_n);
+            midnight_curves::fft::best_fft(chunk, omega_inv, log_n);
             // Scale by 1/n
             for val in chunk.iter_mut() {
                 *val *= n_inv;
@@ -1664,7 +1664,7 @@ pub mod cpu {
 // Generic CPU NTT for any PrimeField
 // =============================================================================
 //
-// This module provides NTT for any field type using halo2curves FFT.
+// This module provides NTT for any field type using midnight_curves FFT.
 // It's used by the Ntt trait's blanket implementation for non-Fq types.
 
 /// Generic CPU NTT functions for any PrimeField
@@ -1688,7 +1688,7 @@ pub mod generic_cpu {
         compute_omega::<F>(log_n).invert().unwrap()
     }
 
-    /// Forward NTT using halo2curves FFT for any PrimeField
+    /// Forward NTT using midnight_curves FFT for any PrimeField
     pub fn forward_ntt<F>(input: &[F]) -> Result<Vec<F>, NttError>
     where
         F: PrimeField,
@@ -1708,12 +1708,12 @@ pub mod generic_cpu {
         let omega = compute_omega::<F>(log_n);
 
         let mut output = input.to_vec();
-        halo2curves::fft::best_fft(&mut output, omega, log_n);
+        midnight_curves::fft::best_fft(&mut output, omega, log_n);
 
         Ok(output)
     }
 
-    /// Forward NTT in-place using halo2curves FFT
+    /// Forward NTT in-place using midnight_curves FFT
     pub fn forward_ntt_inplace<F>(data: &mut [F]) -> Result<(), NttError>
     where
         F: PrimeField,
@@ -1732,12 +1732,12 @@ pub mod generic_cpu {
         let log_n = n.trailing_zeros();
         let omega = compute_omega::<F>(log_n);
 
-        halo2curves::fft::best_fft(data, omega, log_n);
+        midnight_curves::fft::best_fft(data, omega, log_n);
 
         Ok(())
     }
 
-    /// Inverse NTT using halo2curves FFT
+    /// Inverse NTT using midnight_curves FFT
     pub fn inverse_ntt<F>(input: &[F]) -> Result<Vec<F>, NttError>
     where
         F: PrimeField,
@@ -1757,7 +1757,7 @@ pub mod generic_cpu {
         let omega_inv = compute_omega_inv::<F>(log_n);
 
         let mut output = input.to_vec();
-        halo2curves::fft::best_fft(&mut output, omega_inv, log_n);
+        midnight_curves::fft::best_fft(&mut output, omega_inv, log_n);
 
         // Scale by 1/n
         let n_inv = F::from(n as u64).invert().unwrap();
@@ -1787,7 +1787,7 @@ pub mod generic_cpu {
         let log_n = n.trailing_zeros();
         let omega_inv = compute_omega_inv::<F>(log_n);
 
-        halo2curves::fft::best_fft(data, omega_inv, log_n);
+        midnight_curves::fft::best_fft(data, omega_inv, log_n);
 
         // Scale by 1/n
         let n_inv = F::from(n as u64).invert().unwrap();
@@ -1820,7 +1820,7 @@ pub mod generic_cpu {
         let omega = compute_omega::<F>(log_n);
 
         for chunk in output.chunks_mut(poly_size) {
-            halo2curves::fft::best_fft(chunk, omega, log_n);
+            midnight_curves::fft::best_fft(chunk, omega, log_n);
         }
 
         Ok(output)
@@ -1849,7 +1849,7 @@ pub mod generic_cpu {
         let n_inv = F::from(poly_size as u64).invert().unwrap();
 
         for chunk in output.chunks_mut(poly_size) {
-            halo2curves::fft::best_fft(chunk, omega_inv, log_n);
+            midnight_curves::fft::best_fft(chunk, omega_inv, log_n);
             for val in chunk.iter_mut() {
                 *val *= n_inv;
             }
@@ -2544,7 +2544,7 @@ mod auto_tests {
 
     /// Test that CPU and GPU both produce correct roundtrip results
     /// 
-    /// Note: CPU (halo2curves) and GPU (ICICLE) may use different primitive roots of unity,
+    /// Note: CPU (midnight_curves) and GPU (ICICLE) may use different primitive roots of unity,
     /// so intermediate NTT results may differ. However, both should correctly roundtrip
     /// (forward + inverse should return the original).
     #[test]
