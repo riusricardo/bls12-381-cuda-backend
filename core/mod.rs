@@ -79,6 +79,7 @@
 
 pub mod backend;
 pub mod config;
+pub mod dispatch;
 pub mod msm;
 pub mod ntt;
 pub mod stream;
@@ -89,6 +90,20 @@ pub mod vecops;
 // Core exports
 pub use backend::{ensure_backend_loaded, is_gpu_available, GpuError};
 pub use config::{device_type, min_gpu_size, min_ntt_gpu_size, should_use_gpu, should_use_gpu_ntt, should_use_gpu_batch, backend_path, device_id, DeviceType};
+
+// Dispatch helpers for type-safe GPU/CPU dispatch (the key abstraction for consumers)
+pub use dispatch::{
+    // Type checking
+    is_fq, is_g1_affine, is_g1_projective,
+    should_dispatch_to_gpu_field, should_dispatch_to_gpu_curve, should_dispatch_to_gpu_ntt,
+    // Slice conversion
+    try_as_fq_slice, try_as_fq_slice_mut, try_as_g1_affine_slice, try_as_g1_projective_slice,
+    projective_to_curve,
+    // High-level dispatch
+    dispatch_msm, dispatch_ntt_inplace, dispatch_batch_msm, DispatchResult,
+    // With-pattern helpers
+    with_fq_slice, with_fq_slice_mut, with_g1_affine_slice,
+};
 
 // Trait-based abstraction layer (the recommended API for consumers)
 pub use traits::{
